@@ -24,15 +24,15 @@ RUN make PREFIX=/artifacts cmds
 
 FROM ${BASE_IMAGE}
 
-LABEL io.k8s.display-name="Example Resource Driver for Dynamic Resource Allocation (DRA)"
-LABEL name="Example Resource Driver for Dynamic Resource Allocation (DRA)"
-LABEL vendor="example.com"
+LABEL io.k8s.display-name="kube-ovn NIC DRA Driver"
+LABEL name="kube-ovn NIC DRA Driver"
+LABEL vendor="kube-ovn.io"
 ARG VERSION="N/A"
 LABEL version=${VERSION}
 ARG RELEASE="N/A"
 LABEL release="N/A"
-LABEL summary="Example DRA resource driver for Kubernetes"
+LABEL summary="Dynamic Resource Allocation driver for kube-ovn virtual NICs"
 LABEL description="See summary"
 
-COPY --from=build /artifacts/dra-example-kubeletplugin /usr/bin/dra-example-kubeletplugin
-COPY --from=build /artifacts/dra-example-webhook       /usr/bin/dra-example-webhook
+COPY --from=build /artifacts/kube-ovn-dra-kubeletplugin /usr/bin/kube-ovn-dra-kubeletplugin
+COPY --from=build /artifacts/kube-ovn-dra-webhook       /usr/bin/kube-ovn-dra-webhook

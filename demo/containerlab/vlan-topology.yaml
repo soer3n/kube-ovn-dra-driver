@@ -1,0 +1,100 @@
+# Containerlab topology: VLAN switch + FRR gateway wired to all kind nodes as eth1.
+#
+# FRR (frr-gw) peers with kube-ovn-speaker on each node via eBGP and
+# redistributes VLAN subnet routes into the host kernel — no manual
+# `ip route add` required. The host reaches pods via the FRR container's
+# VLAN sub-interfaces.
+#
+# Node names must match `kind get nodes` output:
+#   nic-dra-demo-control-plane, nic-dra-demo-worker
+#
+# Manual usage:
+#   sudo containerlab deploy -t demo/containerlab/vlan-topology.yaml
+#   sudo containerlab destroy -t demo/containerlab/vlan-topology.yaml --cleanup
+
+name: nic-dra-demo-vlan
+
+# Use a management subnet that does not overlap with the kind Docker network
+# (172.20.0.0/16). 172.22.20.0/24 is outside all pre-existing ranges.
+mgmt:
+  network: clab-nic-dra-demo
+  ipv4-subnet: 172.22.20.0/24
+  ipv6-subnet: 3fff:172:22:20::/64
+
+topology:
+  nodes:
+    # Linux bridge acting as an unmanaged VLAN switch (VLAN filtering enabled
+    # by the Makefile after deploy).
+    vlan-switch:
+      kind: bridge
+
+    # FRR gateway: BGP router that peers with kube-ovn-speaker on each node
+    # and installs VLAN subnet routes into the host via kernel netlink.
+    #
+    # eth1 is a trunk port on vlan-switch. FRR creates VLAN sub-interfaces
+    # internally and announces/learns routes over BGP ASN 65000 (kube-ovn)
+    # <-> ASN 65001 (this router).
+    frr-gw:
+      kind: linux
+      image: quay.io/frrouting/frr:10.2.1
+      # Keep the container connected to the host network namespace so that
+      # BGP-learned routes are installed into the host routing table.
+      network-mode: host
+      binds:
+        - frr/frr.conf:/etc/frr/frr.conf:ro
+        - frr/daemons:/etc/frr/daemons:ro
+      exec:
+        # Create VLAN sub-interfaces on eth1 (the trunk link to vlan-switch).
+        # VLAN <100*i> -> 172.<22+i>.0.253/24 gateway. Keep in sync with
+        # demo/nic-example/00-kube-ovn-subnets.yaml (generate.py).
+        - ip link add link eth1 name eth1.100 type vlan id 100
+        - ip link add link eth1 name eth1.200 type vlan id 200
+        - ip link add link eth1 name eth1.300 type vlan id 300
+        - ip link add link eth1 name eth1.400 type vlan id 400
+        - ip link add link eth1 name eth1.500 type vlan id 500
+        - ip link add link eth1 name eth1.600 type vlan id 600
+        - ip link add link eth1 name eth1.700 type vlan id 700
+        - ip link add link eth1 name eth1.800 type vlan id 800
+        - ip addr add 172.23.0.253/24 dev eth1.100
+        - ip addr add 172.24.0.253/24 dev eth1.200
+        - ip addr add 172.25.0.253/24 dev eth1.300
+        - ip addr add 172.26.0.253/24 dev eth1.400
+        - ip addr add 172.27.0.253/24 dev eth1.500
+        - ip addr add 172.28.0.253/24 dev eth1.600
+        - ip addr add 172.29.0.253/24 dev eth1.700
+        - ip addr add 172.30.0.253/24 dev eth1.800
+        - ip link set eth1.100 up
+        - ip link set eth1.200 up
+        - ip link set eth1.300 up
+        - ip link set eth1.400 up
+        - ip link set eth1.500 up
+        - ip link set eth1.600 up
+        - ip link set eth1.700 up
+        - ip link set eth1.800 up
+        - /usr/lib/frr/frrinit.sh start
+
+    # kind control-plane
+    nic-dra-demo-control-plane:
+      kind: ext-container
+      exec:
+        - ip link set eth1 up
+
+    # kind worker
+    nic-dra-demo-worker:
+      kind: ext-container
+      exec:
+        - ip link set eth1 up
+
+  links:
+    # control-plane eth1 <-> vlan-switch
+    - endpoints:
+        - "nic-dra-demo-control-plane:eth1"
+        - "vlan-switch:port1"
+    # worker eth1 <-> vlan-switch
+    - endpoints:
+        - "nic-dra-demo-worker:eth1"
+        - "vlan-switch:port2"
+    # FRR gateway trunk <-> vlan-switch
+    - endpoints:
+        - "frr-gw:eth1"
+        - "vlan-switch:port3"

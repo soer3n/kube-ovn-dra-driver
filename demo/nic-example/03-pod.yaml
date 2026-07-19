@@ -1,0 +1,29 @@
+# Pod that starts with one underlay + one overlay secondary NIC via the DRA
+# ResourceClaim above. The pod gets:
+#   eth0  -> default kube-ovn pod network
+#   net1  -> vlan100-subnet (172.23.0.0/24, VLAN 100 underlay)
+#   net2  -> ovn-subnet     (10.200.0.0/24, OVN overlay)
+# For higher NIC counts (scaling demo), see demo/nic-example/examples/ and
+# `make nic-example-deploy COUNT=4|8|16`.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-nic-demo
+  namespace: default
+spec:
+  # Reference the claim; kubelet will call PrepareResourceClaims before starting.
+  resourceClaims:
+    - name: multi-nic
+      resourceClaimName: pod-multi-nic
+  containers:
+    - name: demo
+      image: nicolaka/netshoot@sha256:47b907d662d139d1e2f22bfe14f4efca1e3f1feed283572f47c970c780c03b61
+      command: ["sleep", "infinity"]
+      # Expose the claim to this container.
+      resources:
+        claims:
+          - name: multi-nic
+      securityContext:
+        capabilities:
+          add: ["NET_ADMIN"]

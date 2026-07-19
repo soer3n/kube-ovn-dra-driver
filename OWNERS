@@ -1,9 +1,6 @@
 # See the OWNERS docs at https://go.k8s.io/owners
 
 approvers:
-  - bart0sh
-  - elezar
-  - klueska
-  - pohly
-  - byako
-  - nojnhuh
+  - soer3n
+reviewers:
+  - soer3n

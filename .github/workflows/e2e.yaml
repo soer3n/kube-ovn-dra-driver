@@ -1,6 +1,13 @@
 name: Run e2e tests
 
-on: [ push, pull_request ]
+# Manual only: the e2e suite stands up a full kind + kube-ovn (DRA fork image) +
+# driver stack, which is heavy and depends on the published
+# docker.io/soer3n/kube-ovn:dra-driver-<version> image. Trigger from the Actions
+# tab when you want to validate end-to-end. The VLAN-underlay (containerlab)
+# specs are not run here (they need sudo + containerlab); run those locally with
+# E2E_CONTAINERLAB=1.
+on:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,18 +22,18 @@ jobs:
         go-version: 1.25.5
     - name: Checkout code
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-    - name: Build
-      run: make PREFIX=artifacts cmds
     - name: install helm and kubectl
       run: |
         sudo snap install helm --classic
         sudo snap install kubectl --classic
     - name: install kind
-      run: |
-        go install sigs.k8s.io/kind@v0.27.0
+      # kind >= v0.31 defaults to a v1.35 node image, required for the stable
+      # resource.k8s.io/v1 DRA API the driver uses.
+      run: go install sigs.k8s.io/kind@v0.31.0
     - name: Setup e2e
       run: make setup-e2e
-    - name: run e2e test
+    - name: Run e2e tests
       run: make test-e2e
-    - name: teardown e2e test
-      run: make teardown-e2e 
+    - name: Teardown e2e
+      if: always()
+      run: make teardown-e2e

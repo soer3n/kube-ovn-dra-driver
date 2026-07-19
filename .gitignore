@@ -2,7 +2,18 @@
 vendor/
 [._]*.sw[a-p]
 
-./dra-example-kubeletplugin
+./kube-ovn-dra-kubeletplugin
+./kube-ovn-dra-webhook
 
 driver_image.tar
 *.tgz
+
+# Ephemeral benchmark fixtures (make nic-bench)
+.bench/
+
+# containerlab's own generated lab runtime directory (make clab-deploy) —
+# recreated fresh on every deploy, contains a generated TLS CA private key.
+demo/containerlab/clab-*/
+
+__pycache__/
+*.pyc

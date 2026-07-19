@@ -1,0 +1,12 @@
+{{- if .Values.webhook.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-webhook-issuer
+  namespace: {{ include "kube-ovn-dra-driver.namespace" . }}
+  labels:
+    {{- include "kube-ovn-dra-driver.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook
+spec:
+  selfSigned: {}
+{{- end }}

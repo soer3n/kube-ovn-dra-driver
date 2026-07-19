@@ -14,46 +14,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This scripts invokes `kind build image` so that the resulting
-# image has a containerd with CDI support.
-#
-# Usage: kind-build-image.sh <tag of generated image>
+# Shared environment for the release-artifact scripts (build-driver-image.sh,
+# push-driver-image.sh, push-driver-chart.sh), invoked by `make
+# push-release-artifacts`. The kind cluster lifecycle lives in the Makefile's
+# kind-* targets (demo/kind/kind-no-cni.yaml), not here.
 
 # A reference to the current directory where this script is located
 SCRIPTS_DIR="$(cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)"
 
-# The name of the example driver
-: ${DRIVER_NAME:=dra-example-driver}
+# The name of the driver
+: ${DRIVER_NAME:=kube-ovn-dra-driver}
 
-# The registry, image and tag for the example driver
-: ${DRIVER_IMAGE_REGISTRY:="registry.k8s.io/dra-example-driver"}
+# The registry, image and tag for the driver
+: ${DRIVER_IMAGE_REGISTRY:="ghcr.io/soer3n"}
 : ${DRIVER_IMAGE_NAME:="${DRIVER_NAME}"}
 : ${DRIVER_IMAGE_TAG:="$(cat $(git rev-parse --show-toplevel)/deployments/helm/${DRIVER_NAME}/Chart.yaml | grep appVersion | sed 's/"//g' | sed -n 's/^appVersion: //p')"}
 : ${DRIVER_IMAGE_PLATFORM:="ubuntu22.04"}
 
-# The kubernetes repo to build the kind cluster from
-: ${KIND_K8S_REPO:="https://github.com/kubernetes/kubernetes.git"}
-
-# The kubernetes tag to build the kind cluster from
-# From ${KIND_K8S_REPO}/tags
-: ${KIND_K8S_TAG:="v1.35.0"}
-
-# At present, kind has a new enough node image that we don't need to build our
-# own. This won't always be true and we may need to set the variable below to
-# 'true' from time to time as things change.
-: ${BUILD_KIND_IMAGE:="false"}
-
-# The name of the kind cluster to create
-: ${KIND_CLUSTER_NAME:="${DRIVER_NAME}-cluster"}
-
-# The path to kind's cluster configuration file
-: ${KIND_CLUSTER_CONFIG_PATH:="${SCRIPTS_DIR}/kind-cluster-config.yaml"}
-
 # The derived name of the driver image to build
 : ${DRIVER_IMAGE:="${DRIVER_IMAGE_REGISTRY}/${DRIVER_IMAGE_NAME}:${DRIVER_IMAGE_TAG}"}
-
-# The name of the kind image to build / run
-: ${KIND_IMAGE:="kindest/node:${KIND_K8S_TAG}"}
 
 # Container tool, e.g. docker/podman
 if [[ -z "${CONTAINER_TOOL}" ]]; then
@@ -68,5 +47,3 @@ if [[ -z "${CONTAINER_TOOL}" ]]; then
         return 1
     fi
 fi
-
-: ${KIND:="env KIND_EXPERIMENTAL_PROVIDER=${CONTAINER_TOOL} kind"}

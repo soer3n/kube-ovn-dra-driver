@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-
-# Copyright 2024 The Kubernetes Authors.
+# Copyright The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,27 +12,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Brings up the e2e cluster for `make test-e2e`. Everything is driven through the
+# Makefile's kind-*/kube-ovn targets, so all cluster and kube-ovn Helm values are
+# sourced from a single place (the Makefile) — this script only orders them.
 #
-# stop at first failure to save time
-set -e
+# Set E2E_CONTAINERLAB=1 to also wire the VLAN underlay (needs sudo + containerlab),
+# which enables the Label("containerlab") specs.
+set -euo pipefail
 
-bash demo/build-driver.sh
-bash demo/create-cluster.sh
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
 
-helm upgrade -i \
-  --repo https://charts.jetstack.io \
-  --version v1.16.3 \
-  --create-namespace \
-  --namespace cert-manager \
-  --wait \
-  --set crds.enabled=true \
-  cert-manager \
-  cert-manager
+make kind-create
+if [ "${E2E_CONTAINERLAB:-0}" = "1" ]; then
+  make clab-deploy
+fi
+make kind-deploy-kube-ovn
+# Subnets + DeviceClass MUST exist before the driver starts: the plugin
+# enumerates kube-ovn Subnets once at startup (no watch), so deploying them
+# afterwards would leave the ResourceSlice empty.
+make kind-deploy-nic-prereqs
+make kind-build-driver
+make kind-deploy-driver
 
-helm upgrade -i \
-  --create-namespace \
-  --namespace dra-example-driver \
-  --set webhook.enabled=true \
-  --set kubeletPlugin.numDevices=10 \
-  dra-example-driver \
-  deployments/helm/dra-example-driver
+# The e2e suite applies/removes its own ResourceClaim+pod fixture, so the base
+# demo claim/pod (kind-deploy-nic-example) is intentionally NOT deployed here.
+
+echo "e2e cluster ready. Run: make test-e2e"

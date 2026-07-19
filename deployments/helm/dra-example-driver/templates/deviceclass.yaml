@@ -1,9 +1,0 @@
----
-apiVersion: {{ include "dra-example-driver.resourceApiVersion" . }}
-kind: DeviceClass
-metadata:
-  name: {{ include "dra-example-driver.driverName" . }}
-spec:
-  selectors:
-  - cel:
-      expression: "device.driver == '{{ include "dra-example-driver.driverName" . }}'"

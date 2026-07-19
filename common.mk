@@ -14,19 +14,18 @@
 
 GOLANG_VERSION ?= 1.25.5
 
-DRIVER_NAME := dra-example-driver
-MODULE := sigs.k8s.io/$(DRIVER_NAME)
+DRIVER_NAME := kube-ovn-dra-driver
+MODULE := github.com/soer3n/$(DRIVER_NAME)
 
 VERSION  ?=
 vVERSION := v$(VERSION:v%=%)
 
-VENDOR := example.com
-APIS := gpu/v1alpha1
+VENDOR := kube-ovn.io
+APIS := nic/v1alpha1
 
-PLURAL_EXCEPTIONS  = DeviceClassParameters:DeviceClassParameters
-PLURAL_EXCEPTIONS += GpuClaimParameters:GpuClaimParameters
+PLURAL_EXCEPTIONS  = NicConfig:NicConfig
 
 ifeq ($(IMAGE_NAME),)
-REGISTRY ?= registry.example.com
+REGISTRY ?= ghcr.io/soer3n
 IMAGE_NAME = $(REGISTRY)/$(DRIVER_NAME)
 endif

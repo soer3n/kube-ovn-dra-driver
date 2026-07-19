@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-
-# Copyright 2023 The Kubernetes Authors.
+# Copyright The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This scripts invokes `kind build image` so that the resulting
-# image has a containerd with CDI support.
-#
-# Usage: kind-build-image.sh <tag of generated image>
+# Tears down the e2e cluster created by setup-e2e.sh.
+set -euo pipefail
 
-set -e
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
 
-bash demo/delete-cluster.sh
+if [ "${E2E_CONTAINERLAB:-0}" = "1" ]; then
+  make clab-destroy || true
+fi
+make kind-delete

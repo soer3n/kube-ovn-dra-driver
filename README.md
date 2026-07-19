@@ -1,476 +1,185 @@
-# Example Resource Driver for Dynamic Resource Allocation (DRA)
+# kube-ovn NIC DRA Driver
 
-This repository contains an example resource driver for use with the [Dynamic
-Resource Allocation
+A [Dynamic Resource Allocation
 (DRA)](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/)
-feature of Kubernetes.
+driver for **kube-ovn virtual NICs**. It publishes each kube-ovn `Subnet` on a
+node as a DRA device, so a workload can request a secondary network interface
+(`net1`, `net2`, …) through a `ResourceClaim` instead of a Multus annotation.
 
-It is intended to demonstrate best-practices for how to construct a DRA
-resource driver and wrap it in a [helm chart](https://helm.sh/). It can be used
-as a starting point for implementing a driver for your own set of resources.
+> Forked from
+> [`kubernetes-sigs/dra-example-driver`](https://github.com/kubernetes-sigs/dra-example-driver)
+> and rewritten around a single `nic` device profile.
 
-## Quickstart and Demo
+> 📖 **New here?** Jump to [Documentation](#documentation) for a map of the design
+> docs and the "is this the right approach?" decision aids before diving in.
 
-Before diving into the details of how this example driver is constructed, it's
-useful to run through a quick demo of it in action.
+## Status & scope
 
-The driver itself provides access to a set of mock GPU devices, and this demo
-walks through the process of building and installing the driver followed by
-running a set of workloads that consume these GPUs.
+> **This is an exploration, not a product.** It started from a concrete problem —
+> Multus attaching many secondary NICs *serially* makes pod startup latency grow
+> linearly with NIC count — and investigates whether **DRA** does better for
+> kube-ovn SDN NICs (structurally yes: parallel per-NIC IPAM, scheduler-aware
+> placement, IP-pool capacity, clean lifecycle — though the latency *magnitude* is
+> still to be measured with `make nic-bench`). It also probes the adjacent,
+> still-emerging upstream
+> work — **multi-network-api** (SIG-Network), **KNDM/DraNet**, and **KubeVirt
+> VEP-183** — to see how an SDN DRA driver fits. See
+> [`docs/kndm-dranet-comparison.md`](docs/kndm-dranet-comparison.md) for the
+> findings and [`docs/multi-network-api-integration.md`](docs/multi-network-api-integration.md)
+> for the target architecture (network API + DRA).
 
-The procedure below has been tested and verified on both Linux and Mac.
+- **IPAM for secondary NICs (committed):** the driver reserves an address/MAC
+  from the chosen kube-ovn `Subnet`. Two modes:
+  - `pkg/annotation` — IPAM-on-top-of-Multus (writes kube-ovn pod annotations).
+  - `pkg/kubeovnip` — Multus-free IPAM via the `ips.kubeovn.io` CRD.
+- **Driver-owned netns attach (Multus-free):** `pkg/plumbing` + an NRI sandbox
+  hook create the veth/OVS port and move the interface into the pod netns, for
+  both VLAN underlay and OVN overlay. Enabled with `kubeletPlugin.nicAttach.enabled`.
+  **Validated end-to-end on the kind demo** (overlay + underlay), given the
+  kube-ovn controller patch — see
+  [`docs/nic-driver.md`](docs/nic-driver.md) for the full design and current state.
 
-### Prerequisites
+## Requirement: kube-ovn with secondary-NIC DRA support
 
-* [GNU Make 3.81+](https://www.gnu.org/software/make/)
-* [GNU Tar 1.34+](https://www.gnu.org/software/tar/)
-* [docker v20.10+ (including buildx)](https://docs.docker.com/engine/install/) or [Podman v4.9+](https://podman.io/docs/installation)
-* [kind v0.17.0+](https://kind.sigs.k8s.io/docs/user/quick-start/)
-* [helm v3.7.0+](https://helm.sh/docs/intro/install/)
-* [kubectl v1.18+](https://kubernetes.io/docs/reference/kubectl/)
+This driver depends on kube-ovn changes that are **not yet in an upstream
+release**. Build/run kube-ovn from the fork branch:
 
-### Demo
-We start by first cloning this repository and `cd`ing into it. All of the
-scripts and example Pod specs used in this demo are contained here, so take a
-moment to browse through the various files and see what's available:
 ```
-git clone https://github.com/kubernetes-sigs/dra-example-driver.git
-cd dra-example-driver
+https://github.com/soer3n/kube-ovn   branch: add-dra-support-for-secondary-nics
 ```
 
-**Note**: The scripts will automatically use either `docker`, or `podman` as the container tool command, whichever
-can be found in the PATH. To override this behavior, set `CONTAINER_TOOL` environment variable either by calling
-`export CONTAINER_TOOL=docker`, or by prepending `CONTAINER_TOOL=docker` to a script
-(e.g. `CONTAINER_TOOL=docker ./path/to/script.sh`). Keep in mind that building Kind images currently requires Docker.
+> The branch will be pushed once driver preparation is complete. Until then the
+> kind demo expects a kube-ovn dev image built from that branch (see
+> `KUBE_OVN_VERSION` / image-preload steps in the `Makefile`).
 
-From here we will build the image for the example resource driver:
+**Kubernetes:** the driver uses the stable DRA API (`resource.k8s.io/v1`),
+requiring **Kubernetes 1.34+**; it is built and tested against **1.35**
+(`k8s.io/*` pinned to `v0.35.x`).
+
+## Quickstart (kind)
+
+A full kube-ovn + (optional Multus) + NIC DRA stack can be brought up in a local
+[kind](https://kind.sigs.k8s.io/) cluster. All targets are under the `kind-*` /
+`clab-*` prefixes in the `Makefile`.
+
 ```bash
-./demo/build-driver.sh
+# Create cluster, wire the VLAN uplink via containerlab + FRR, deploy kube-ovn
+# (+ multus), build & load the driver image, install the chart, apply the NIC
+# example.
+make kind-demo
+
+# Tear down
+make kind-delete
 ```
 
-And create a `kind` cluster to run it in:
+Step by step:
+
 ```bash
-./demo/create-cluster.sh
+make kind-create             # kind cluster, no CNI, DRA feature-gates on
+make clab-deploy             # OPTIONAL: containerlab VLAN uplink + FRR BGP gateway (needs sudo)
+make kind-deploy-kube-ovn    # kube-ovn CNI (dev image from the fork branch) -> nodes Ready
+make kind-deploy-multus      # OPTIONAL: Multus (only needed for the annotation IPAM mode)
+make kind-build-driver       # docker build -> kind load
+make kind-deploy-driver      # helm install (deviceProfile=nic)
+make kind-deploy-nic-example # subnets, DeviceClass, ResourceClaim, demo pod
+make kind-test-vlan          # dual-VLAN traffic + host-routing + isolation checks (needs clab-deploy)
 ```
 
-Once the cluster has been created successfully, double check everything is
-coming up as expected:
-```console
-$ kubectl get pod -A
-NAMESPACE            NAME                                                               READY   STATUS    RESTARTS   AGE
-kube-system          coredns-5d78c9869d-6jrx9                                           1/1     Running   0          1m
-kube-system          coredns-5d78c9869d-dpr8p                                           1/1     Running   0          1m
-kube-system          etcd-dra-example-driver-cluster-control-plane                      1/1     Running   0          1m
-kube-system          kindnet-g88bv                                                      1/1     Running   0          1m
-kube-system          kindnet-msp95                                                      1/1     Running   0          1m
-kube-system          kube-apiserver-dra-example-driver-cluster-control-plane            1/1     Running   0          1m
-kube-system          kube-controller-manager-dra-example-driver-cluster-control-plane   1/1     Running   0          1m
-kube-system          kube-proxy-kgz4z                                                   1/1     Running   0          1m
-kube-system          kube-proxy-x6fnd                                                   1/1     Running   0          1m
-kube-system          kube-scheduler-dra-example-driver-cluster-control-plane            1/1     Running   0          1m
-local-path-storage   local-path-provisioner-7dbf974f64-9jmc7                            1/1     Running   0          1m
-```
+See [`docs/nic-driver.md`](docs/nic-driver.md) for the containerlab topology, the VLAN
+underlay vs OVN overlay device types, and the tunable `make` variables.
 
-The validating admission webhook is disabled by default. To enable it, install cert-manager and its CRDs, then
-set the `webhook.enabled=true` value when the dra-example-driver chart is installed.
+## Install with Helm
+
 ```bash
-helm install \
-  --repo https://charts.jetstack.io \
-  --version v1.16.3 \
-  --create-namespace \
-  --namespace cert-manager \
-  --wait \
-  --set crds.enabled=true \
-  cert-manager \
-  cert-manager
-```
-More options for installing cert-manager can be found in [their docs](https://cert-manager.io/docs/installation/)
-
-And then install the example resource driver via `helm`.
-```bash
-helm upgrade -i \
-  --create-namespace \
-  --namespace dra-example-driver \
-  dra-example-driver \
-  deployments/helm/dra-example-driver
+helm install kube-ovn-dra-driver deployments/helm/kube-ovn-dra-driver \
+  --namespace kube-system \
+  --set deviceProfile=nic
+# driverName defaults to "nic.kubeovn.io"; the optional validating webhook is
+# behind --set webhook.enabled=true, and the Multus-free attach datapath behind
+# --set kubeletPlugin.nicAttach.enabled=true.
 ```
 
-Double check the driver components have come up successfully:
-```console
-$ kubectl get pod -n dra-example-driver
-NAME                                                  READY   STATUS    RESTARTS   AGE
-dra-example-driver-kubeletplugin-qwmbl                1/1     Running   0          1m
-dra-example-driver-webhook-7d465fbd5b-n2wxt           1/1     Running   0          1m
-```
+## Requesting a NIC
 
-And show the initial state of available GPU devices on the worker node:
-```
-$ kubectl get resourceslice -o yaml
-apiVersion: v1
-items:
-- apiVersion: resource.k8s.io/v1
-  kind: ResourceSlice
-  metadata:
-    creationTimestamp: "2024-12-09T16:17:09Z"
-    generateName: dra-example-driver-cluster-worker-gpu.example.com-
-    generation: 1
-    name: dra-example-driver-cluster-worker-gpu.example.com-rf2f7
-    ownerReferences:
-    - apiVersion: v1
-      controller: true
-      kind: Node
-      name: dra-example-driver-cluster-worker
-      uid: 6633c2e1-d947-40c3-ba1f-78f3c9aad05c
-    resourceVersion: "530"
-    uid: d13fd8bd-0a71-43e1-ba79-ebd2fae4847a
-  spec:
-    driver: gpu.example.com
-    nodeName: dra-example-driver-cluster-worker
-    pool:
-      generation: 0
-      name: dra-example-driver-cluster-worker
-      resourceSliceCount: 1
-    devices:
-    - attributes:
-        driverVersion:
-          version: 1.0.0
-        index:
-          int: 0
-        model:
-          string: LATEST-GPU-MODEL
-        uuid:
-          string: gpu-18db0e85-99e9-c746-8531-ffeb86328b39
-      capacity:
-        memory:
-          value: 80Gi
-      name: gpu-0
-    - attributes:
-        driverVersion:
-          version: 1.0.0
-        index:
-          int: 1
-        model:
-          string: LATEST-GPU-MODEL
-        uuid:
-          string: gpu-93d37703-997c-c46f-a531-755e3e0dc2ac
-      capacity:
-        memory:
-          value: 80Gi
-      name: gpu-1
-    - attributes:
-        driverVersion:
-          version: 1.0.0
-        index:
-          int: 2
-        model:
-          string: LATEST-GPU-MODEL
-        uuid:
-          string: gpu-ee3e4b55-fcda-44b8-0605-64b7a9967744
-      capacity:
-        memory:
-          value: 80Gi
-      name: gpu-2
-    - attributes:
-        driverVersion:
-          version: 1.0.0
-        index:
-          int: 3
-        model:
-          string: LATEST-GPU-MODEL
-        uuid:
-          string: gpu-9ede7e32-5825-a11b-fa3d-bab6d47e0243
-      capacity:
-        memory:
-          value: 80Gi
-      name: gpu-3
-    - attributes:
-        driverVersion:
-          version: 1.0.0
-        index:
-          int: 4
-        model:
-          string: LATEST-GPU-MODEL
-        uuid:
-          string: gpu-e7b42cb1-4fd8-91b2-bc77-352a0c1f5747
-      capacity:
-        memory:
-          value: 80Gi
-      name: gpu-4
-    - attributes:
-        driverVersion:
-          version: 1.0.0
-        index:
-          int: 5
-        model:
-          string: LATEST-GPU-MODEL
-        uuid:
-          string: gpu-f11773a1-5bfb-e48b-3d98-1beb5baaf08e
-      capacity:
-        memory:
-          value: 80Gi
-      name: gpu-5
-    - attributes:
-        driverVersion:
-          version: 1.0.0
-        index:
-          int: 6
-        model:
-          string: LATEST-GPU-MODEL
-        uuid:
-          string: gpu-0159f35e-99ee-b2b5-74f1-9d18df3f22ac
-      capacity:
-        memory:
-          value: 80Gi
-      name: gpu-6
-    - attributes:
-        driverVersion:
-          version: 1.0.0
-        index:
-          int: 7
-        model:
-          string: LATEST-GPU-MODEL
-        uuid:
-          string: gpu-657bd2e7-f5c2-a7f2-fbaa-0d1cdc32f81b
-      capacity:
-        memory:
-          value: 80Gi
-      name: gpu-7
-kind: List
-metadata:
-  resourceVersion: ""
-```
+The driver publishes one `subnet-<name>` device per kube-ovn `Subnet`, with
+attributes under the `nic.kubeovn.io/*` domain (`subnetName`, `subnetType`,
+`vlanId`, `provider`, `vpc`). A pod selects the subnet it wants with a CEL
+selector on its `ResourceClaim`:
 
-Next, deploy four example apps that demonstrate how `ResourceClaim`s,
-`ResourceClaimTemplate`s, and custom `GpuConfig` objects can be used to
-select and configure resources in various ways:
-```bash
-kubectl apply --filename=demo/basic-resourceclaimtemplate.yaml \
-  --filename=demo/basic-multiple-requests.yaml \
-  --filename=demo/basic-shared-claim-across-containers.yaml \
-  --filename=demo/basic-shared-claim-across-pods.yaml \
-  --filename=demo/basic-resourceclaim-opaque-config.yaml
-```
-
-And verify that they are coming up successfully:
-```console
-$ kubectl get pod -A
-NAMESPACE                              NAME   READY   STATUS              RESTARTS   AGE
-...
-basic-resourceclaimtemplate            pod0   0/1     Pending             0          2s
-basic-resourceclaimtemplate            pod1   0/1     Pending             0          2s
-basic-multiple-requests                pod0   0/2     Pending             0          2s
-basic-shared-claim-across-containers   pod0   0/1     ContainerCreating   0          2s
-basic-shared-claim-across-containers   pod1   0/1     ContainerCreating   0          2s
-basic-shared-claim-across-pods         pod0   0/1     Pending             0          2s
-basic-resourceclaim-opaque-config      pod0   0/4     Pending             0          2s
-...
-```
-
-Use your favorite editor to look through each of the `basic-*.yaml`
-files and see what they are doing.
-
-Then dump the logs of each app to verify that GPUs were allocated to them
-according to these semantics:
-```bash
-for ns in basic-resourceclaimtemplate basic-multiple-requests basic-shared-claim-across-containers basic-shared-claim-across-pods basic-resourceclaim-opaque-config; do \
-  echo "${ns}:"
-  for pod in $(kubectl get pod -n ${ns} --output=jsonpath='{.items[*].metadata.name}'); do \
-    for ctr in $(kubectl get pod -n ${ns} ${pod} -o jsonpath='{.spec.containers[*].name}'); do \
-      echo "${pod} ${ctr}:"
-      kubectl logs -n ${ns} ${pod} -c ${ctr}| grep -E "GPU_DEVICE_[0-9]+" | grep -v "RESOURCE_CLAIM"
-    done
-  done
-  echo ""
-done
-```
-
-This should produce output similar to the following:
-```bash
-basic-resourceclaimtemplate:
-pod0 ctr0:
-declare -x GPU_DEVICE_6="gpu-6"
-pod1 ctr0:
-declare -x GPU_DEVICE_7="gpu-7"
-
-basic-multiple-requests:
-pod0 ctr0:
-declare -x GPU_DEVICE_0="gpu-0"
-declare -x GPU_DEVICE_1="gpu-1"
-
-basic-shared-claim-across-containers:
-pod0 ctr0:
-declare -x GPU_DEVICE_2="gpu-2"
-declare -x GPU_DEVICE_2_SHARING_STRATEGY="TimeSlicing"
-declare -x GPU_DEVICE_2_TIMESLICE_INTERVAL="Default"
-pod0 ctr1:
-declare -x GPU_DEVICE_2="gpu-2"
-declare -x GPU_DEVICE_2_SHARING_STRATEGY="TimeSlicing"
-declare -x GPU_DEVICE_2_TIMESLICE_INTERVAL="Default"
-
-basic-shared-claim-across-pods:
-pod0 ctr0:
-declare -x GPU_DEVICE_3="gpu-3"
-declare -x GPU_DEVICE_3_SHARING_STRATEGY="TimeSlicing"
-declare -x GPU_DEVICE_3_TIMESLICE_INTERVAL="Default"
-pod1 ctr0:
-declare -x GPU_DEVICE_3="gpu-3"
-declare -x GPU_DEVICE_3_SHARING_STRATEGY="TimeSlicing"
-declare -x GPU_DEVICE_3_TIMESLICE_INTERVAL="Default"
-
-basic-resourceclaim-opaque-config:
-pod0 ts-ctr0:
-declare -x GPU_DEVICE_4="gpu-4"
-declare -x GPU_DEVICE_4_SHARING_STRATEGY="TimeSlicing"
-declare -x GPU_DEVICE_4_TIMESLICE_INTERVAL="Long"
-pod0 ts-ctr1:
-declare -x GPU_DEVICE_4="gpu-4"
-declare -x GPU_DEVICE_4_SHARING_STRATEGY="TimeSlicing"
-declare -x GPU_DEVICE_4_TIMESLICE_INTERVAL="Long"
-pod0 sp-ctr0:
-declare -x GPU_DEVICE_5="gpu-5"
-declare -x GPU_DEVICE_5_PARTITION_COUNT="10"
-declare -x GPU_DEVICE_5_SHARING_STRATEGY="SpacePartitioning"
-pod0 sp-ctr1:
-declare -x GPU_DEVICE_5="gpu-5"
-declare -x GPU_DEVICE_5_PARTITION_COUNT="10"
-declare -x GPU_DEVICE_5_SHARING_STRATEGY="SpacePartitioning"
-```
-
-In this example resource driver, no "actual" GPUs are made available to any
-containers. Instead, a set of environment variables are set in each container
-to indicate which GPUs *would* have been injected into them by a real resource
-driver and how they *would* have been configured.
-
-You can use the IDs of the GPUs as well as the GPU sharing settings set in
-these environment variables to verify that they were handed out in a way
-consistent with the semantics shown in the figure above.
-
-### Demo DRA Admin Access Feature
-This example driver includes support for the [DRA AdminAccess feature](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/#admin-access), which allows administrators to gain privileged access to devices already in use by other users. This example demonstrates the end-to-end flow by setting the `DRA_ADMIN_ACCESS` environment variable. A driver managing real devices could use this to expose host hardware information.
-
-#### Usage Example
-
-See `demo/admin-access.yaml` for a complete example. Key points:
-
-1. **Namespace**: Must have the `resource.kubernetes.io/admin-access` label set to create ResourceClaimTemplate and ResourceClaim with `adminAccess: true` for Kubernetes v1.34+.
 ```yaml
-apiVersion: v1
-kind: Namespace
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
 metadata:
-  name: admin-access
-  labels:
-    resource.kubernetes.io/admin-access: "true"
-```
-
-2. **Resource Claim Template**: Request must have `adminAccess: true`. The `allocationMode: All` is used to demonstrate accessing all available devices with admin privileges.
-```yaml
+  name: my-nic
 spec:
-  spec:
-    devices:
-      requests:
-      - name: admin-gpu
+  devices:
+    requests:
+      - name: nic
         exactly:
-          deviceClassName: gpu.example.com
-          allocationMode: All
-          adminAccess: true
+          deviceClassName: kube-ovn-nic
+          selectors:
+            - cel:
+                expression: "device.attributes['nic.kubeovn.io'].subnetName == 'vlan100-subnet'"
+          count: 1
+    config:
+      - requests: ["nic"]
+        opaque:
+          driver: nic.kubeovn.io
+          parameters:
+            apiVersion: nic.resource.kube-ovn.io/v1alpha1
+            kind: NicConfig
+            interfaceName: net1
 ```
 
-3. **Container**: Will receive elevated privileges from the driver, represented here as environment variables
+Worked examples live in [`demo/nic-example/`](demo/nic-example/): a one-underlay
++ one-overlay starting claim, plus scaling fixtures for 2/4/8/16 NICs under
+[`demo/nic-example/examples/`](demo/nic-example/examples/) (regenerate with
+`examples/generate.py`):
+
 ```bash
-echo "DRA Admin Access: $DRA_ADMIN_ACCESS"
-# Output examples:
-# DRA Admin Access: true
+make nic-example-deploy COUNT=4   # 2 VLAN underlay + 2 OVN overlay NICs
 ```
 
-#### Testing
+## Layout
 
-To run this demo:
-```bash
-./demo/test-admin-access.sh
-```
+| Path | Purpose |
+|------|---------|
+| `cmd/kube-ovn-dra-kubeletplugin/` | DRA kubelet plugin (DaemonSet) — publishes ResourceSlices, prepares claims, NRI hook |
+| `cmd/kube-ovn-dra-webhook/` | Validating admission webhook for `NicConfig` opaque config |
+| `internal/profiles/nic/` | The `nic` device profile — enumerates kube-ovn Subnets |
+| `api/kube-ovn.io/resource/nic/v1alpha1/` | `NicConfig` opaque-config type |
+| `pkg/annotation/` | Multus-compatible IPAM (kube-ovn pod annotations) |
+| `pkg/kubeovnip/` | Multus-free IPAM via `ips.kubeovn.io` |
+| `pkg/nicprepare/` | IPAM reservation lifecycle for a claimed NIC |
+| `pkg/plumbing/` | Veth/OVS/netns attach + NRI sandbox hook (validated) |
+| `deployments/helm/kube-ovn-dra-driver/` | Helm chart |
+| `demo/` | kind + containerlab/FRR demo stack and NIC examples |
+| `docs/` | Architecture and design notes |
 
-This demonstration shows the end-to-end flow of the DRA AdminAccess feature. In a production environment, drivers could use this admin access indication to provide additional privileged capabilities or information to authorized workloads.
+## Documentation
 
-### Clean Up
+**Start here** — a map of the repo's docs, by what you're trying to do:
 
-Once you have verified everything is running correctly, delete all of the
-example apps:
-```bash
-kubectl delete --wait=false --filename=demo/basic-resourceclaimtemplate.yaml \
-  --filename=demo/basic-multiple-requests.yaml \
-  --filename=demo/basic-shared-claim-across-containers.yaml \
-  --filename=demo/basic-shared-claim-across-pods.yaml \
-  --filename=demo/basic-resourceclaim-opaque-config.yaml \
-  --filename=demo/admin-access.yaml
-```
+*Understand / run the driver:*
+- [`docs/nic-driver.md`](docs/nic-driver.md) — the main design doc: IPAM flow,
+  device types, shared subnets, kind/VLAN demo, current status.
+- [`docs/architecture.md`](docs/architecture.md) — code walk-through.
+- [`docs/benchmarking.md`](docs/benchmarking.md) — `make nic-bench`: DRA vs. Multus
+  secondary-NIC spin-up (the attach-timing measurement).
 
-And wait for them to terminate:
-```console
-$ kubectl get pod -A
-NAMESPACE                              NAME   READY   STATUS        RESTARTS   AGE
-...
-basic-resourceclaimtemplate            pod0   1/1     Terminating   0          31m
-basic-resourceclaimtemplate            pod1   1/1     Terminating   0          31m
-basic-multiple-requests                pod0   2/2     Terminating   0          31m
-basic-shared-claim-across-containers   pod0   1/1     Terminating   0          31m
-basic-shared-claim-across-containers   pod1   1/1     Terminating   0          31m
-basic-shared-claim-across-pods         pod0   1/1     Terminating   0          31m
-basic-resourceclaim-opaque-config      pod0   4/4     Terminating   0          31m
-admin-access                           pod0   1/1     Terminating   0          31m
-...
-```
+*Evaluate the direction (decision aids — read these if you're asking "is this the
+right approach?"):*
+- [`docs/kndm-dranet-comparison.md`](docs/kndm-dranet-comparison.md) — this driver
+  vs. KNDM/DraNet/SR-IOV/ovn-kubernetes OKEP; "can we just use DraNet/Multus?";
+  is SDN in scope for DRA?; hot-plug; strategic options.
+- [`docs/multi-network-api-integration.md`](docs/multi-network-api-integration.md)
+  — the target architecture: **multi-network-api + DRA**, with this driver as the
+  DRA backend (network API owns *which* network; DRA owns *allocate + attach*).
 
-Finally, you can run the following to cleanup your environment and delete the
-`kind` cluster started previously:
-```bash
-./demo/delete-cluster.sh
-```
+*Upstreaming:*
+- [`docs/kube-ovn-issue-draft.md`](docs/kube-ovn-issue-draft.md) — the kube-ovn
+  controller changes the driver depends on (issue + PR draft).
 
-## Device Profiles
+## License
 
-The example driver can manage several different kinds of devices to demonstrate
-a variety of DRA features. The functionality for each kind of device is
-organized into a "profile." Only one profile is active at a time for a given
-instance of the example driver, though the example driver may be installed
-multiple times in the same cluster with different active profiles. See the Helm
-chart's `deviceProfile` value in values.yaml for available profiles.
-
-For driver developers, this pattern is specific to the example driver and not
-intended to be a recommendation for all DRA drivers. Other drivers will likely
-be simpler by implementing their logic more directly than through an
-abstraction like the example driver's profiles.
-
-## Anatomy of a DRA resource driver
-
-TBD
-
-## Code Organization
-
-TBD
-
-## Best Practices
-
-TBD
-
-## References
-
-For more information on the DRA Kubernetes feature and developing custom resource drivers, see the following resources:
-
-* [Dynamic Resource Allocation in Kubernetes](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/)
-* TBD
-
-## Community, discussion, contribution, and support
-
-Learn how to engage with the Kubernetes community on the [community page](http://kubernetes.io/community/).
-
-You can reach the maintainers of this project at:
-
-- [Slack](https://slack.k8s.io/)
-- [Mailing List](https://groups.google.com/a/kubernetes.io/g/dev)
-
-### Code of conduct
-
-Participation in the Kubernetes community is governed by the [Kubernetes Code of Conduct](code-of-conduct.md).
-
-[owners]: https://git.k8s.io/community/contributors/guide/owners.md
-[Creative Commons 4.0]: https://git.k8s.io/website/LICENSE
+Apache 2.0 — see [`LICENSE`](LICENSE).

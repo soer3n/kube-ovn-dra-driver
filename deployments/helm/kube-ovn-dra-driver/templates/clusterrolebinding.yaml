@@ -1,0 +1,14 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-role-binding
+  namespace: {{ include "kube-ovn-dra-driver.namespace" . }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "kube-ovn-dra-driver.serviceAccountName" . }}
+  namespace: {{ include "kube-ovn-dra-driver.namespace" . }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-role
+  apiGroup: rbac.authorization.k8s.io

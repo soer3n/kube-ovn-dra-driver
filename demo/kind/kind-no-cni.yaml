@@ -1,0 +1,49 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+# Disable the default CNI so we can install kube-ovn + multus ourselves.
+networking:
+  disableDefaultCNI: true
+  # kube-ovn requires a pod subnet; keep the default.
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+nodes:
+  - role: control-plane
+    # kube-ovn needs /lib/modules for openvswitch kernel modules.
+    extraMounts:
+      - hostPath: /lib/modules
+        containerPath: /lib/modules
+        readOnly: true
+    # DRA feature-gates required for ResourceSlice / structured parameters.
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            # DRAConsumableCapacity (alpha) enables AllowMultipleAllocations /
+            # consumable-capacity, so multiple pods can share one Subnet device.
+            feature-gates: "DynamicResourceAllocation=true,DRAConsumableCapacity=true"
+        controllerManager:
+          extraArgs:
+            feature-gates: "DynamicResourceAllocation=true,DRAConsumableCapacity=true"
+        scheduler:
+          extraArgs:
+            # The scheduler does the allocation, so it needs the gate too.
+            feature-gates: "DynamicResourceAllocation=true,DRAConsumableCapacity=true"
+      - |
+        kind: KubeletConfiguration
+        featureGates:
+          DynamicResourceAllocation: true
+          DRAConsumableCapacity: true
+    # NRI is enabled by default in containerd v2.x shipped with kind v1.35+.
+    # No extra patching required.
+  - role: worker
+    extraMounts:
+      - hostPath: /lib/modules
+        containerPath: /lib/modules
+        readOnly: true
+    kubeadmConfigPatches:
+      - |
+        kind: KubeletConfiguration
+        featureGates:
+          DynamicResourceAllocation: true
+          DRAConsumableCapacity: true

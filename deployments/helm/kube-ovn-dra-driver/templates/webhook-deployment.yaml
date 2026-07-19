@@ -1,0 +1,85 @@
+{{- if .Values.webhook.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-webhook
+  namespace: {{ include "kube-ovn-dra-driver.namespace" . }}
+  labels:
+    {{- include "kube-ovn-dra-driver.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook
+spec:
+  selector:
+    matchLabels:
+      {{- include "kube-ovn-dra-driver.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: webhook
+  template:
+    metadata:
+      {{- with .Values.webhook.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "kube-ovn-dra-driver.templateLabels" . | nindent 8 }}
+        app.kubernetes.io/component: webhook
+    spec:
+      {{- if .Values.webhook.priorityClassName }}
+      priorityClassName: {{ .Values.webhook.priorityClassName }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "kube-ovn-dra-driver.webhookServiceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.webhook.podSecurityContext | nindent 8 }}
+      containers:
+      - name: webhook
+        securityContext:
+          {{- toYaml .Values.webhook.containers.webhook.securityContext | nindent 10 }}
+        image: {{ include "kube-ovn-dra-driver.fullimage" . }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: ["kube-ovn-dra-webhook"]
+        args:
+          - --tls-cert-file=/cert/tls.crt
+          - --tls-private-key-file=/cert/tls.key
+          - --port={{ .Values.webhook.containerPort }}
+          - --device-profile={{ .Values.deviceProfile }}
+          - --driver-name={{ include "kube-ovn-dra-driver.driverName" . }}
+        ports:
+          - name: webhook
+            containerPort: {{ .Values.webhook.containerPort }}
+        livenessProbe:
+          failureThreshold: 5
+          httpGet:
+            path: /readyz
+            port: webhook
+            scheme: HTTPS
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /readyz
+            port: webhook
+            scheme: HTTPS
+        volumeMounts:
+        - name: cert
+          mountPath: /cert
+          readOnly: true
+        resources:
+          {{- toYaml .Values.webhook.containers.webhook.resources | nindent 10 }}
+      volumes:
+      - name: cert
+        secret:
+          secretName: {{ include "kube-ovn-dra-driver.fullname" . }}-webhook-cert
+      {{- with .Values.webhook.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.webhook.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.webhook.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
