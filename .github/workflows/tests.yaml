@@ -7,16 +7,12 @@ permissions:
 
 jobs:
   test:
-    strategy:
-      matrix:
-        version: ['1.25.5' ]
-        platform: [ ubuntu-latest, macos-latest ]
-    runs-on: ${{ matrix.platform }}
+    runs-on: ubuntu-latest
     steps:
     - name: Install Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: ${{ matrix.version }}
+        go-version: 1.25.5
     - name: Checkout code
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Build
@@ -26,5 +22,4 @@ jobs:
     - name: Test
       run: go test -v -race ./...
     - name: Test datapath (root)
-      if: runner.os == 'Linux'
       run: make test-privileged
