@@ -5,9 +5,10 @@
 # its ResourceSlice device with AllowMultipleAllocations=true. Each pod still gets
 # its own address, MAC and logical switch port from kube-ovn-controller.
 #
-# Requires the DRAConsumableCapacity feature gate (alpha) — enabled in
-# demo/kind/kind-no-cni.yaml on apiserver, scheduler and kubelet. Without it the
-# second pod stays Pending ("cannot allocate all claims").
+# Requires the DRAConsumableCapacity feature gate (alpha in Kubernetes 1.34 and
+# 1.35, beta and on by default from 1.36) — enabled in demo/kind/kind-no-cni.yaml
+# on apiserver, scheduler and kubelet. Without it the second pod stays Pending
+# ("cannot allocate all claims").
 #
 #   kubectl apply -f demo/nic-example/examples/shared-subnet.yaml
 #   kubectl get pod shared-a shared-b -o wide

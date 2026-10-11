@@ -346,6 +346,7 @@ Tunable variables (override on the `make` command line):
 |----------|---------|---------|
 | `KIND_CLUSTER_NAME` | `nic-dra-demo` | kind cluster name |
 | `KIND_NODE_IMAGE` | `kindest/node:v1.36.4` | Kubernetes node image (1.34 or later; the demo and e2e run on 1.36) |
+| `PUBLISH_MODE` | `central` | Who publishes the devices: `central` (publisher, one pool per Subnet, capacity) or `node` (every kubelet plugin) |
 | `KUBE_OVN_VERSION` | `dra-nic-upstream` | kube-ovn git ref to take the chart from — the branch with `--enable-dra-nic`, not a release tag |
 | `KUBE_OVN_REPO` | `../kube-ovn` | local kube-ovn checkout holding `KUBE_OVN_VERSION` |
 | `KUBE_OVN_IMAGE` | `docker.io/soer3n/kube-ovn:dra-driver-<version>` | kube-ovn image built from `KUBE_OVN_VERSION` |
@@ -384,23 +385,69 @@ kube-ovn-controller. The subnet genuinely has hundreds of IPs.
 
 - **Feature gate:** `AllowMultipleAllocations` (and the richer consumable-capacity
   API) are gated by **`DRAConsumableCapacity`** — *alpha, default-off* in k8s
-  1.34/1.35. It must be enabled on **apiserver + scheduler + kubelet**; the kind
-  config (`demo/kind/kind-no-cni.yaml`) sets it.
+  1.34 and 1.35, *beta and on by default* from 1.36. On 1.34 and 1.35 it must be
+  enabled on **apiserver + scheduler + kubelet**; the kind config
+  (`demo/kind/kind-no-cni.yaml`) sets it explicitly, so it works on all of them.
 - **Demo/test:** `demo/nic-example/examples/shared-subnet.yaml` (two pods on
   `ovn-subnet`, overlay → no containerlab) and the e2e spec
   *"connects pods that share a subnet over the overlay"*.
 
-**`AllowMultipleAllocations` vs consumable-capacity — pick per goal:**
+**`AllowMultipleAllocations` vs consumable capacity, by publish mode:**
 
-| | `AllowMultipleAllocations: true` (used now) | Consumable capacity (`Device.Capacity` + `RequestPolicy`) |
+| | node mode (default): `AllowMultipleAllocations: true` | central mode: plus consumable capacity (`Device.Capacity` + `RequestPolicy`) |
 |---|---|---|
-| Effect | unlimited sharing of the device | each request consumes 1 unit of a finite pool |
+| Effect | unlimited sharing of the device | each request consumes one address of a finite pool |
 | Scheduler enforces IP exhaustion | ❌ no | ✅ yes (refuses to schedule when the pool is full) |
-| Driver work | one field | publish capacity from the Subnet's free-IP count + keep it fresh |
+| Driver work | one field | the publisher publishes the free addresses and keeps them current |
 | Same gate | `DRAConsumableCapacity` | `DRAConsumableCapacity` |
 
 `AllowMultipleAllocations` is the minimal fix that makes shared subnets work.
-Consumable-capacity is the KND-idiomatic upgrade that also makes **IP-pool
-exhaustion a scheduling decision** (a genuine day-0 advantage over Multus) — the
-natural next step if the driver continues. See
+Consumable capacity, published by the central publisher (see
+[Publish modes](#publish-modes)), also makes **IP-pool exhaustion a scheduling
+decision**, a day-0 advantage over Multus. See
 [`kndm-dranet-comparison.md`](kndm-dranet-comparison.md).
+
+## Publish modes
+
+The driver can publish its devices in two ways, chosen with the Helm value
+`publisher.enabled` (the kubelet plugins follow with `--publish-mode`).
+
+| | node mode (default) | central mode (`publisher.enabled=true`) |
+|---|---|---|
+| Who publishes | every kubelet plugin | one leader-elected `publisher` Deployment, same image |
+| Pools | one per node, with all Subnets | one per Subnet, named after the Subnet |
+| Overlay Subnet | on every node | available on all nodes |
+| VLAN underlay Subnet | on every node | only on the nodes where its ProviderNetwork is ready |
+| IP-pool capacity | none | free addresses per address family |
+
+**Why central.** Capacity is counted per device. With one pool per node every
+node would get a full pool of its own, so the cluster could hand out many times
+the real number of addresses. A Subnet is one pool for the whole cluster, so it
+is one device with a cluster-wide scope. That scope also fixes the placement of
+VLAN Subnets: only the nodes that carry the provider bridge and its uplink can
+serve a VLAN NIC. kube-ovn labels them `<provider>.provider-network.kubernetes.io/ready=true`,
+and the pool of a VLAN Subnet selects on that label. kube-ovn-controller needs no
+change, it already looks a device up by driver and pool name.
+
+**Capacity.** Per address family the device publishes
+
+    capacity = free + held
+
+where `free` is the free-address count of the Subnet status and `held` is the
+number of DRA claims allocated to the device whose address kube-ovn already
+allocated. The scheduler subtracts every allocated claim from the capacity. A
+claim whose address is allocated is in the free count already, so it is added
+back, and a claim that waits for its address is counted by the scheduler alone.
+The scheduler therefore sees the addresses that are still free, also while a
+burst of pods waits for kube-ovn. A request policy gives one address per NIC by
+default, so claims need no capacity request. A stopped keep-vm-ip VM keeps its
+address, which the free count already reflects.
+
+The numbers follow the Subnet status and the ip objects, so they are eventually
+consistent: in a small window a pod can still be scheduled when the last address
+is taken by a pod outside DRA, and then fails when kube-ovn allocates, as it
+would without capacity.
+
+Turn capacity off with `publisher.capacity=false`. The Makefile deploys central
+mode by default (`PUBLISH_MODE=central`); use `PUBLISH_MODE=node` for the other.
+The e2e specs *central publish mode* run only against central mode.

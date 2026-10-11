@@ -106,7 +106,12 @@ helm install kube-ovn-dra-driver oci://registry-1.docker.io/soer3n/kube-ovn-dra-
 # driverName defaults to "nic.kubeovn.io", which is also kube-ovn-controller's
 # default --dra-nic-driver-name. The optional validating webhook is behind
 # --set webhook.enabled=true.
+# --set publisher.enabled=true publishes one cluster-wide pool per Subnet (VLAN
+# Subnets only on the nodes of their ProviderNetwork) with the free addresses as
+# capacity, so the scheduler refuses a pod when a pool is exhausted.
 ```
+
+See [Publish modes](docs/nic-driver.md#publish-modes) for the two ways to publish.
 
 ## Requesting a NIC
 
