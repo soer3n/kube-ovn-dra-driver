@@ -84,6 +84,8 @@ spec:
           value: {{ include "kube-ovn-dra-driver.driverName" . | quote }}
         - name: DEVICE_PROFILE
           value: {{ .Values.deviceProfile | quote }}
+        - name: PUBLISH_MODE
+          value: {{ ternary "central" "node" .Values.publisher.enabled | quote }}
         - name: CDI_ROOT
           value: /var/run/cdi
         - name: KUBELET_REGISTRAR_DIRECTORY_PATH

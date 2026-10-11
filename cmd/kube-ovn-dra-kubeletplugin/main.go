@@ -53,6 +53,7 @@ type Flags struct {
 	profile                       string
 	driverName                    string
 	podUID                        string
+	publishMode                   string
 }
 
 type Config struct {
@@ -87,6 +88,14 @@ func (c Config) DriverPluginPath() string {
 }
 
 func main() {
+	// The publisher runs from the same image, selected by its first argument.
+	if started, err := runPublisherIfRequested(os.Args); started {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := newApp().Run(os.Args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -147,6 +156,15 @@ func newApp() *cli.App {
 			EnvVars:     []string{"DRIVER_NAME"},
 		},
 		&cli.StringFlag{
+			Name: "publish-mode",
+			Usage: fmt.Sprintf("Who publishes the devices. In %q mode this plugin publishes a pool for its node. "+
+				"In %q mode the publisher publishes one pool per Subnet and this plugin only prepares claims.",
+				publishModeNode, publishModeCentral),
+			Value:       publishModeNode,
+			Destination: &flags.publishMode,
+			EnvVars:     []string{"PUBLISH_MODE"},
+		},
+		&cli.StringFlag{
 			Name:        "pod-uid",
 			Usage:       "UID of the pod (used for seamless upgrades to create unique socket names).",
 			Destination: &flags.podUID,
@@ -165,6 +183,9 @@ func newApp() *cli.App {
 		Before: func(c *cli.Context) error {
 			if c.Args().Len() > 0 {
 				return fmt.Errorf("arguments not supported: %v", c.Args().Slice())
+			}
+			if flags.publishMode != publishModeNode && flags.publishMode != publishModeCentral {
+				return fmt.Errorf("invalid publish mode %q, valid modes are %q and %q", flags.publishMode, publishModeNode, publishModeCentral)
 			}
 			return flags.loggingConfig.Apply()
 		},

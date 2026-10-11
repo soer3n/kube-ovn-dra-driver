@@ -37,12 +37,12 @@ import (
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
-	"k8s.io/utils/ptr"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 	cdispec "tags.cncf.io/container-device-interface/specs-go"
 
 	configapi "github.com/soer3n/kube-ovn-dra-driver/api/kube-ovn.io/resource/nic/v1alpha1"
 	"github.com/soer3n/kube-ovn-dra-driver/internal/profiles"
+	"github.com/soer3n/kube-ovn-dra-driver/internal/publisher"
 )
 
 const ProfileName = "nic"
@@ -78,7 +78,10 @@ func NewProfile(nodeName string, dynamicClient dynamic.Interface) Profile {
 }
 
 // EnumerateDevices implements profiles.Profile.
-// It lists all kube-ovn Subnets and exposes each one as a DRA device.
+// It lists all kube-ovn Subnets and exposes each one as a DRA device in the pool
+// of the node. This is the layout of the node publish mode, in which every
+// kubelet plugin publishes the devices of its node. The central publish mode
+// builds its pools with the same publisher package.
 func (p Profile) EnumerateDevices() (resourceslice.DriverResources, error) {
 	ctx := context.Background()
 	subnets, err := p.dynamicClient.Resource(subnetGVR).List(ctx, metav1.ListOptions{})
@@ -86,72 +89,28 @@ func (p Profile) EnumerateDevices() (resourceslice.DriverResources, error) {
 		return resourceslice.DriverResources{}, fmt.Errorf("list kube-ovn subnets: %w", err)
 	}
 
+	// A VLAN underlay subnet does not carry the id on the Subnet itself; it
+	// references a Vlan CR via spec.vlan. Resolve that Vlan so claims can
+	// select underlay subnets by type, VLAN id or ProviderNetwork.
+	vlans := func(name string) (publisher.VlanInfo, error) {
+		vlan, err := p.dynamicClient.Resource(vlanGVR).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return publisher.VlanInfo{}, err
+		}
+		return publisher.ParseVlan(vlan), nil
+	}
+
 	var devices []resourceapi.Device
-	for _, subnet := range subnets.Items {
-		spec, _ := subnet.Object["spec"].(map[string]interface{})
-		if spec == nil {
+	for i := range subnets.Items {
+		subnet := &subnets.Items[i]
+		if spec, _ := subnet.Object["spec"].(map[string]interface{}); spec == nil {
 			continue
 		}
-
-		name := subnet.GetName()
-		subnetType := "ovn" // default: OVN overlay
-		vlanID := int64(0)
-		provider := ""
-		providerNetwork := ""
-		vpc := ""
-
-		if v, ok := spec["provider"].(string); ok {
-			provider = v
+		s, err := publisher.ParseSubnet(subnet, vlans)
+		if err != nil {
+			return resourceslice.DriverResources{}, err
 		}
-		if v, ok := spec["vpc"].(string); ok {
-			vpc = v
-		}
-
-		// A VLAN underlay subnet does not carry the id on the Subnet itself; it
-		// references a Vlan CR via spec.vlan. Resolve that Vlan so claims can
-		// select underlay subnets by type, VLAN id or ProviderNetwork.
-		if vlanName, _ := spec["vlan"].(string); vlanName != "" {
-			vlan, err := p.dynamicClient.Resource(vlanGVR).Get(ctx, vlanName, metav1.GetOptions{})
-			if err != nil {
-				return resourceslice.DriverResources{}, fmt.Errorf("get vlan %q referenced by subnet %q: %w", vlanName, name, err)
-			}
-			vspec, _ := vlan.Object["spec"].(map[string]interface{})
-			if id, _ := vspec["id"].(int64); id != 0 {
-				subnetType = "vlan"
-				vlanID = id
-				if pn, _ := vspec["provider"].(string); pn != "" {
-					providerNetwork = pn
-				}
-			}
-		}
-
-		attrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-			"nic.kubeovn.io/subnetName": {StringValue: ptr.To(name)},
-			"nic.kubeovn.io/subnetType": {StringValue: ptr.To(subnetType)},
-		}
-		if vlanID != 0 {
-			attrs["nic.kubeovn.io/vlanId"] = resourceapi.DeviceAttribute{IntValue: ptr.To(vlanID)}
-		}
-		if provider != "" {
-			attrs["nic.kubeovn.io/provider"] = resourceapi.DeviceAttribute{StringValue: ptr.To(provider)}
-		}
-		if providerNetwork != "" {
-			attrs["nic.kubeovn.io/providerNetwork"] = resourceapi.DeviceAttribute{StringValue: ptr.To(providerNetwork)}
-		}
-		if vpc != "" {
-			attrs["nic.kubeovn.io/vpc"] = resourceapi.DeviceAttribute{StringValue: ptr.To(vpc)}
-		}
-
-		devices = append(devices, resourceapi.Device{
-			Name:       fmt.Sprintf("subnet-%s", name),
-			Attributes: attrs,
-			// A kube-ovn Subnet is a shared IP pool, not an exclusive device:
-			// many pods can each take an address from it. Allow the device to be
-			// allocated to multiple claims (each pod still gets its own address
-			// and logical switch port). Requires the DRAConsumableCapacity
-			// feature gate on apiserver, scheduler and kubelet.
-			AllowMultipleAllocations: ptr.To(true),
-		})
+		devices = append(devices, publisher.Device(s, false))
 	}
 
 	resources := resourceslice.DriverResources{
@@ -260,9 +219,5 @@ func envKey(ifaceName string) string {
 // subnetNameFromDevice strips the "subnet-" prefix from the device name to
 // recover the original kube-ovn Subnet name.
 func subnetNameFromDevice(deviceName string) string {
-	const prefix = "subnet-"
-	if len(deviceName) > len(prefix) && deviceName[:len(prefix)] == prefix {
-		return deviceName[len(prefix):]
-	}
-	return deviceName
+	return publisher.SubnetName(deviceName)
 }

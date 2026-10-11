@@ -434,18 +434,27 @@ kind-build-driver:
 		$(CURDIR)
 	kind load docker-image $(IMAGE_NAME):dev --name $(KIND_CLUSTER_NAME)
 
-## kind-deploy-driver: install the NIC DRA kubelet-plugin via Helm.
+# Who publishes the devices. "central" runs the publisher: one pool per Subnet,
+# available on the nodes of the ProviderNetwork for a VLAN Subnet, with the free
+# addresses of the Subnet as capacity. "node" lets every kubelet plugin publish a
+# pool for its node, with all Subnets and no capacity (the chart default).
+PUBLISH_MODE      ?= central
+
+## kind-deploy-driver: install the NIC DRA kubelet-plugin via Helm, and with
+## PUBLISH_MODE=central the publisher.
 ## Tolerates the control-plane's NoSchedule taint so the demo's 2-node kind
-## cluster gets a ResourceSlice on BOTH nodes — needed for fixtures that pin
-## pods to the control-plane (07-vlan-peer-pod.yaml, 08-ovn-peer-pod.yaml),
-## which otherwise stay Pending ("cannot allocate all claims": no device
-## published for that node).
+## cluster has the plugin on BOTH nodes — needed for fixtures that pin pods to
+## the control-plane (07-vlan-peer-pod.yaml, 08-ovn-peer-pod.yaml), which
+## otherwise stay Pending (in node mode: "cannot allocate all claims", no device
+## published for that node; in central mode the plugin that prepares the claim
+## is missing).
 kind-deploy-driver:
 	$(HELM) upgrade --install kube-ovn-nic-dra \
 		$(CURDIR)/deployments/helm/kube-ovn-dra-driver \
 		--namespace kube-system \
 		--set deviceProfile=nic \
 		--set driverName=$(NIC_DRIVER_NAME) \
+		--set publisher.enabled=$(if $(filter central,$(PUBLISH_MODE)),true,false) \
 		--set image.repository=$(IMAGE_NAME) \
 		--set image.tag=dev \
 		--set image.pullPolicy=Never \

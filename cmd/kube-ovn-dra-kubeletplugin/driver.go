@@ -26,6 +26,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	coreclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
 
 	"github.com/soer3n/kube-ovn-dra-driver/pkg/plumbing"
@@ -70,7 +71,16 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 		return nil, fmt.Errorf("start healthcheck: %w", err)
 	}
 
-	if err := helper.PublishResources(ctx, state.driverResources); err != nil {
+	// In node mode this plugin publishes the devices of its node. In central mode
+	// the publisher publishes one pool per Subnet, which can be scoped to the
+	// nodes of a ProviderNetwork and can carry the free addresses as capacity.
+	// The plugin still enumerates the devices, to prepare the claims that name
+	// them, and keeps that list current, but it publishes nothing.
+	publish := helper.PublishResources
+	if config.flags.publishMode == publishModeCentral {
+		klog.FromContext(ctx).Info("Central publish mode: the publisher publishes the devices, this plugin only prepares claims")
+		publish = func(context.Context, resourceslice.DriverResources) error { return nil }
+	} else if err := publish(ctx, state.driverResources); err != nil {
 		return nil, err
 	}
 
@@ -84,7 +94,7 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 	}); err != nil {
 		return nil, fmt.Errorf("watch devices: %w", err)
 	}
-	go refreshDevicesLoop(ctx, trigger, refreshDelay, state.RefreshDevices, helper.PublishResources)
+	go refreshDevicesLoop(ctx, trigger, refreshDelay, state.RefreshDevices, publish)
 
 	// Start the NRI plugin that attaches the NICs when a pod sandbox is
 	// created. Without it, claims are still prepared but pods start without

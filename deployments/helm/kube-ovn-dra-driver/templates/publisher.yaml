@@ -1,0 +1,166 @@
+{{- if .Values.publisher.enabled }}
+# The publisher publishes every kube-ovn Subnet as its own cluster-wide pool: all
+# nodes for an overlay Subnet, the nodes of the ProviderNetwork for a VLAN
+# underlay Subnet, and optionally the free addresses as consumable capacity. With
+# it, the kubelet plugins run in central publish mode and publish nothing.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-publisher
+  namespace: {{ include "kube-ovn-dra-driver.namespace" . }}
+  labels:
+    {{- include "kube-ovn-dra-driver.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publisher
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-publisher
+  labels:
+    {{- include "kube-ovn-dra-driver.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publisher
+rules:
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceslices"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# The allocated claims tell how many addresses DRA holds in a Subnet.
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceclaims"]
+  verbs: ["get", "list", "watch"]
+# Subnets with their free addresses, the Vlan each VLAN Subnet references, and
+# the ip objects that show which claims already have their address.
+- apiGroups: ["kubeovn.io"]
+  resources: ["subnets", "vlans", "ips"]
+  verbs: ["get", "list", "watch"]
+# A claim is reserved for a pod. For a KubeVirt VM the pod names the VM that
+# owns the address.
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-publisher
+  labels:
+    {{- include "kube-ovn-dra-driver.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publisher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-publisher
+subjects:
+- kind: ServiceAccount
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-publisher
+  namespace: {{ include "kube-ovn-dra-driver.namespace" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-publisher
+  namespace: {{ include "kube-ovn-dra-driver.namespace" . }}
+  labels:
+    {{- include "kube-ovn-dra-driver.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publisher
+rules:
+# Leader election: only one publisher publishes.
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update"]
+# The Deployment owns the ResourceSlices, so they are removed with it.
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  resourceNames: ["{{ include "kube-ovn-dra-driver.fullname" . }}-publisher"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-publisher
+  namespace: {{ include "kube-ovn-dra-driver.namespace" . }}
+  labels:
+    {{- include "kube-ovn-dra-driver.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publisher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-publisher
+subjects:
+- kind: ServiceAccount
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-publisher
+  namespace: {{ include "kube-ovn-dra-driver.namespace" . }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kube-ovn-dra-driver.fullname" . }}-publisher
+  namespace: {{ include "kube-ovn-dra-driver.namespace" . }}
+  labels:
+    {{- include "kube-ovn-dra-driver.labels" . | nindent 4 }}
+    app.kubernetes.io/component: publisher
+spec:
+  # More than one replica only gives a faster takeover: the leader election lets
+  # one of them publish.
+  replicas: {{ .Values.publisher.replicas }}
+  selector:
+    matchLabels:
+      {{- include "kube-ovn-dra-driver.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: publisher
+  template:
+    metadata:
+      {{- with .Values.publisher.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "kube-ovn-dra-driver.templateLabels" . | nindent 8 }}
+        app.kubernetes.io/component: publisher
+    spec:
+      {{- if .Values.publisher.priorityClassName }}
+      priorityClassName: {{ .Values.publisher.priorityClassName }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "kube-ovn-dra-driver.fullname" . }}-publisher
+      {{- with .Values.publisher.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.publisher.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.publisher.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: publisher
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        image: {{ include "kube-ovn-dra-driver.fullimage" . }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: ["/usr/local/bin/kube-ovn-dra-kubeletplugin", "publisher"]
+        resources:
+          {{- toYaml .Values.publisher.resources | nindent 10 }}
+        env:
+        - name: DRIVER_NAME
+          value: {{ include "kube-ovn-dra-driver.driverName" . | quote }}
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: OWNER_DEPLOYMENT
+          value: {{ include "kube-ovn-dra-driver.fullname" . }}-publisher
+        - name: PUBLISH_CAPACITY
+          value: {{ .Values.publisher.capacity | quote }}
+{{- end }}
