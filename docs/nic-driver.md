@@ -160,7 +160,7 @@ disabled, DRA feature-gates enabled, `/lib/modules` mounted for OVS).
 **Kubernetes version:** the driver uses the stable DRA API
 (`resource.k8s.io/v1`), which requires **Kubernetes 1.34+**; the repo is built
 and tested against **1.35** (`k8s.io/*` deps pinned to `v0.35.x`). `kind-create`
-pins the node image via `KIND_NODE_IMAGE` (default `kindest/node:v1.35.8`,
+pins the node image via `KIND_NODE_IMAGE` (default `kindest/node:v1.36.4`,
 the 1.35 image of **kind v0.33.0**, pinned by digest). Use kind v0.33.0 with it;
 kind node images are built for a specific kind release. Override to test another
 release:
@@ -345,7 +345,7 @@ Tunable variables (override on the `make` command line):
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `KIND_CLUSTER_NAME` | `nic-dra-demo` | kind cluster name |
-| `KIND_NODE_IMAGE` | `kindest/node:v1.35.8` | Kubernetes node image (1.35 or later) |
+| `KIND_NODE_IMAGE` | `kindest/node:v1.36.4` | Kubernetes node image (1.34 or later; the demo and e2e run on 1.36) |
 | `KUBE_OVN_VERSION` | `dra-nic-upstream` | kube-ovn git ref to take the chart from — the branch with `--enable-dra-nic`, not a release tag |
 | `KUBE_OVN_REPO` | `../kube-ovn` | local kube-ovn checkout holding `KUBE_OVN_VERSION` |
 | `KUBE_OVN_IMAGE` | `docker.io/soer3n/kube-ovn:dra-driver-<version>` | kube-ovn image built from `KUBE_OVN_VERSION` |

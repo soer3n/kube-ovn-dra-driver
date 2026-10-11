@@ -19,8 +19,10 @@ nodes:
         kind: ClusterConfiguration
         apiServer:
           extraArgs:
-            # DRAConsumableCapacity (alpha) enables AllowMultipleAllocations /
+            # DRAConsumableCapacity enables AllowMultipleAllocations /
             # consumable-capacity, so multiple pods can share one Subnet device.
+            # Alpha in Kubernetes 1.34 and 1.35, beta and on by default from 1.36;
+            # setting it explicitly keeps the older releases working.
             feature-gates: "DynamicResourceAllocation=true,DRAConsumableCapacity=true"
         controllerManager:
           extraArgs:
