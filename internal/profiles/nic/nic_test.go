@@ -18,6 +18,7 @@ package nic
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -32,30 +33,127 @@ import (
 	"k8s.io/utils/ptr"
 
 	configapi "github.com/soer3n/kube-ovn-dra-driver/api/kube-ovn.io/resource/nic/v1alpha1"
+	"github.com/soer3n/kube-ovn-dra-driver/internal/publisher"
 )
 
-const testNode = "node1"
+// Values shared by the tests of this package.
+const (
+	testNode                 = "node1"
+	testSubnet               = "blue"
+	testDevice               = "subnet-blue"
+	testProvider             = "blue.default.ovn"
+	testOtherSubnet          = "red"
+	testOtherProvider        = "red.default.ovn"
+	testDefaultSubnet        = "default"
+	testVlan                 = "vlan100"
+	testVlanProvider         = "vlan100.default.ovn"
+	testProviderNetwork      = "external"
+	testVPC                  = "ovn-cluster"
+	testOther                = "other"
+	testFixedMTUSubnet       = "fixed"
+	testOverlaySubnet        = "overlay"
+	testUnderlaySubnet       = "underlay"
+	testLogicalGatewaySubnet = "lgw"
+	testFloatMTUSubnet       = "float"
+	testMissingVlanSubnet    = "missing-vlan"
+	testNoPNSubnet           = "no-pn"
+	testNoMTULabelSubnet     = "no-mtu-label"
+	testMissingSubnet        = "missing"
+	testMissingVlan          = "vlan-missing"
+	testVlanNoPN             = "vlan101"
+	testVlanOtherPN          = "vlan102"
+	testUnderlayMTU          = "9000"
+	testInvalidMTU           = "jumbo"
+	testKubeOVNAPIVersion    = "kubeovn.io/v1"
+	defaultProvider          = "ovn"
+	typeOVN                  = "ovn"
+	typeVlan                 = "vlan"
+	labelTrue                = "true"
+	testRequestA             = "a"
+	testRequestB             = "b"
+
+	kindSubnet = "Subnet"
+	kindVlan   = "Vlan"
+	kindNode   = "Node"
+
+	// Fields of the kube-ovn and node fixtures.
+	fieldAPIVersion     = "apiVersion"
+	fieldKind           = "kind"
+	fieldMetadata       = "metadata"
+	fieldName           = "name"
+	fieldLabels         = "labels"
+	fieldSpec           = "spec"
+	fieldStatus         = "status"
+	fieldPhase          = "phase"
+	fieldProvider       = "provider"
+	fieldCIDRBlock      = "cidrBlock"
+	fieldVlan           = "vlan"
+	fieldVPC            = "vpc"
+	fieldID             = "id"
+	fieldMTU            = "mtu"
+	fieldLogicalGateway = "logicalGateway"
+	fieldEnableDHCP     = "enableDHCP"
+	testOVNDHCPSubnet   = "ovn-dhcp"
+	fieldV4Using        = "v4usingIPs"
+)
 
 func kubeOVNObject(kind, name string, spec map[string]interface{}) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]interface{}{
-		"apiVersion": "kubeovn.io/v1",
-		"kind":       kind,
-		"metadata":   map[string]interface{}{"name": name},
-		"spec":       spec,
+		fieldAPIVersion: testKubeOVNAPIVersion,
+		fieldKind:       kind,
+		fieldMetadata:   map[string]interface{}{fieldName: name},
+		fieldSpec:       spec,
 	}}
 }
 
+// testNodeObject returns the profile's node, ready on the given ProviderNetworks.
+func testNodeObject(readyOn ...string) *unstructured.Unstructured {
+	labels := map[string]interface{}{}
+	for _, pn := range readyOn {
+		labels[publisher.ReadyLabel(pn)] = labelTrue
+	}
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		fieldAPIVersion: "v1",
+		fieldKind:       kindNode,
+		fieldMetadata:   map[string]interface{}{fieldName: testNode, fieldLabels: labels},
+	}}
+}
+
+// newTestProfile returns a profile whose node is ready on the ProviderNetwork
+// "external", unless objects contain another node object.
 func newTestProfile(objects ...runtime.Object) Profile {
+	hasNode := false
+	for _, obj := range objects {
+		if u, ok := obj.(*unstructured.Unstructured); ok && u.GetKind() == kindNode {
+			hasNode = true
+		}
+	}
+	if !hasNode {
+		objects = append(objects, testNodeObject(testProviderNetwork))
+	}
 	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{subnetGVR: "SubnetList", vlanGVR: "VlanList"}, objects...)
+		map[schema.GroupVersionResource]string{subnetGVR: "SubnetList", vlanGVR: "VlanList", nodeGVR: "NodeList"}, objects...)
 	return NewProfile(testNode, client)
+}
+
+// subnetSpec returns the spec of a publishable Subnet with the given provider.
+func subnetSpec(provider string, extra ...string) map[string]interface{} {
+	spec := map[string]interface{}{fieldProvider: provider, fieldCIDRBlock: "10.10.0.0/24"}
+	for i := 0; i+1 < len(extra); i += 2 {
+		spec[extra[i]] = extra[i+1]
+	}
+	return spec
 }
 
 func TestEnumerateDevices(t *testing.T) {
 	p := newTestProfile(
-		kubeOVNObject("Subnet", "blue", map[string]interface{}{"provider": "blue.default.ovn", "vpc": "ovn-cluster"}),
-		kubeOVNObject("Subnet", "vlan100", map[string]interface{}{"provider": "vlan100.default.ovn", "vlan": "vlan100"}),
-		kubeOVNObject("Vlan", "vlan100", map[string]interface{}{"id": int64(100), "provider": "external"}),
+		kubeOVNObject(kindSubnet, testSubnet, subnetSpec(testProvider, fieldVPC, testVPC)),
+		kubeOVNObject(kindSubnet, testVlan, subnetSpec(testVlanProvider, fieldVlan, testVlan)),
+		// Not publishable: the default provider, a non-OVN provider, no CIDR.
+		kubeOVNObject(kindSubnet, testDefaultSubnet, subnetSpec(defaultProvider)),
+		kubeOVNObject(kindSubnet, "macvlan", subnetSpec("macvlan.default")),
+		kubeOVNObject(kindSubnet, "nocidr", map[string]interface{}{fieldProvider: "nocidr.default.ovn"}),
+		kubeOVNObject(kindVlan, testVlan, map[string]interface{}{fieldID: int64(100), fieldProvider: testProviderNetwork}),
 	)
 	resources, err := p.EnumerateDevices()
 	require.NoError(t, err)
@@ -66,29 +164,59 @@ func TestEnumerateDevices(t *testing.T) {
 	}
 	require.Len(t, devices, 2)
 
-	blue := devices["subnet-blue"]
-	assert.Equal(t, ptr.To("blue"), blue.Attributes["nic.kubeovn.io/subnetName"].StringValue)
-	assert.Equal(t, ptr.To("ovn"), blue.Attributes["nic.kubeovn.io/subnetType"].StringValue)
-	assert.Equal(t, ptr.To("blue.default.ovn"), blue.Attributes["nic.kubeovn.io/provider"].StringValue)
-	assert.Equal(t, ptr.To("ovn-cluster"), blue.Attributes["nic.kubeovn.io/vpc"].StringValue)
-	assert.NotContains(t, blue.Attributes, resourceapi.QualifiedName("nic.kubeovn.io/vlanId"))
+	blue := devices[testDevice]
+	assert.Equal(t, ptr.To(testSubnet), blue.Attributes[publisher.AttrSubnetName].StringValue)
+	assert.Equal(t, ptr.To(typeOVN), blue.Attributes[publisher.AttrSubnetType].StringValue)
+	assert.Equal(t, ptr.To(testProvider), blue.Attributes[publisher.AttrProvider].StringValue)
+	assert.Equal(t, ptr.To(testVPC), blue.Attributes[publisher.AttrVPC].StringValue)
+	assert.NotContains(t, blue.Attributes, publisher.AttrVlanID)
 	assert.Equal(t, ptr.To(true), blue.AllowMultipleAllocations)
 
 	vlan := devices["subnet-vlan100"]
-	assert.Equal(t, ptr.To("vlan"), vlan.Attributes["nic.kubeovn.io/subnetType"].StringValue)
-	assert.Equal(t, ptr.To(int64(100)), vlan.Attributes["nic.kubeovn.io/vlanId"].IntValue)
-	assert.Equal(t, ptr.To("external"), vlan.Attributes["nic.kubeovn.io/providerNetwork"].StringValue)
+	assert.Equal(t, ptr.To(typeVlan), vlan.Attributes[publisher.AttrSubnetType].StringValue)
+	assert.Equal(t, ptr.To(int64(100)), vlan.Attributes[publisher.AttrVlanID].IntValue)
+	assert.Equal(t, ptr.To(testProviderNetwork), vlan.Attributes[publisher.AttrProviderNetwork].StringValue)
+}
+
+// A VLAN Subnet is only published on a node where its ProviderNetwork is ready.
+func TestEnumerateDevicesSkipsVlanWithoutProviderNetwork(t *testing.T) {
+	p := newTestProfile(
+		testNodeObject(testOther),
+		kubeOVNObject(kindSubnet, testSubnet, subnetSpec(testProvider)),
+		kubeOVNObject(kindSubnet, testVlan, subnetSpec(testVlanProvider, fieldVlan, testVlan)),
+		kubeOVNObject(kindVlan, testVlan, map[string]interface{}{fieldID: int64(100), fieldProvider: testProviderNetwork}),
+	)
+	resources, err := p.EnumerateDevices()
+	require.NoError(t, err)
+	devices := resources.Pools[testNode].Slices[0].Devices
+	require.Len(t, devices, 1)
+	assert.Equal(t, testDevice, devices[0].Name)
+}
+
+// A Subnet whose name is no valid device name gets a hashed device name; the
+// CDI environment still names the Subnet.
+func TestEnumerateDevicesLongSubnetName(t *testing.T) {
+	name := "net.v1"
+	p := newTestProfile(kubeOVNObject(kindSubnet, name, subnetSpec("net.default.ovn")))
+	resources, err := p.EnumerateDevices()
+	require.NoError(t, err)
+	devices := resources.Pools[testNode].Slices[0].Devices
+	require.Len(t, devices, 1)
+	assert.Equal(t, publisher.DeviceName(name), devices[0].Name)
+	edits, err := p.ApplyConfig(nil, []*resourceapi.DeviceRequestAllocationResult{{Request: testRequestA, Device: devices[0].Name}})
+	require.NoError(t, err)
+	assert.Contains(t, edits["a/"+devices[0].Name].Env, "KUBE_OVN_NIC_NET1_SUBNET="+name)
 }
 
 func TestEnumerateDevicesMissingVlan(t *testing.T) {
-	p := newTestProfile(kubeOVNObject("Subnet", "vlan100", map[string]interface{}{"vlan": "vlan100"}))
+	p := newTestProfile(kubeOVNObject(kindSubnet, testVlan, map[string]interface{}{fieldVlan: testVlan}))
 	_, err := p.EnumerateDevices()
 	assert.Error(t, err)
 }
 
 func TestApplyConfig(t *testing.T) {
 	p := newTestProfile()
-	results := []*resourceapi.DeviceRequestAllocationResult{{Request: "a", Device: "subnet-blue"}, {Request: "b", Device: "subnet-blue"}}
+	results := []*resourceapi.DeviceRequestAllocationResult{{Request: testRequestA, Device: testDevice}, {Request: testRequestB, Device: testDevice}}
 
 	edits, err := p.ApplyConfig(nil, results)
 	require.NoError(t, err)
@@ -119,13 +247,13 @@ func TestSchemeBuilder(t *testing.T) {
 }
 
 func TestSubnetNameFromDevice(t *testing.T) {
-	assert.Equal(t, "blue", subnetNameFromDevice("subnet-blue"))
-	assert.Equal(t, "subnet-", subnetNameFromDevice("subnet-"))
-	assert.Equal(t, "other", subnetNameFromDevice("other"))
+	p := newTestProfile()
+	assert.Equal(t, testSubnet, p.subnetNameFromDevice(testDevice))
+	assert.Equal(t, testOther, p.subnetNameFromDevice(testOther))
 }
 
 func TestWatchDevices(t *testing.T) {
-	p := newTestProfile(kubeOVNObject("Subnet", "blue", map[string]interface{}{"provider": "blue.default.ovn"}))
+	p := newTestProfile(kubeOVNObject(kindSubnet, testSubnet, map[string]interface{}{fieldProvider: testProvider}))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	changes := make(chan struct{}, 10)
@@ -150,27 +278,110 @@ func TestWatchDevices(t *testing.T) {
 	expectChange("the initial list")
 
 	subnets := p.dynamicClient.Resource(subnetGVR)
-	red := kubeOVNObject("Subnet", "red", map[string]interface{}{"provider": "red.default.ovn"})
+	red := kubeOVNObject(kindSubnet, testOtherSubnet, map[string]interface{}{fieldProvider: testOtherProvider})
 	_, err := subnets.Create(ctx, red, metav1.CreateOptions{})
 	require.NoError(t, err)
 	expectChange("a new subnet")
 
-	blue, err := subnets.Get(ctx, "blue", metav1.GetOptions{})
+	blue, err := subnets.Get(ctx, testSubnet, metav1.GetOptions{})
 	require.NoError(t, err)
-	blue.Object["status"] = map[string]interface{}{"v4usingIPs": int64(3)}
+	blue.Object[fieldStatus] = map[string]interface{}{fieldV4Using: int64(3)}
 	blue, err = subnets.Update(ctx, blue, metav1.UpdateOptions{})
 	require.NoError(t, err)
 	expectNoChange("a status update")
 
-	blue.Object["spec"] = map[string]interface{}{"provider": "blue2.default.ovn"}
+	blue.Object["spec"] = map[string]interface{}{fieldProvider: "blue2.default.ovn"}
 	_, err = subnets.Update(ctx, blue, metav1.UpdateOptions{})
 	require.NoError(t, err)
 	expectChange("a spec update")
 
-	require.NoError(t, subnets.Delete(ctx, "red", metav1.DeleteOptions{}))
+	require.NoError(t, subnets.Delete(ctx, testOtherSubnet, metav1.DeleteOptions{}))
 	expectChange("a deleted subnet")
 
-	_, err = p.dynamicClient.Resource(vlanGVR).Create(ctx, kubeOVNObject("Vlan", "vlan100", map[string]interface{}{"id": int64(100)}), metav1.CreateOptions{})
+	_, err = p.dynamicClient.Resource(vlanGVR).Create(ctx, kubeOVNObject(kindVlan, testVlan, map[string]interface{}{fieldID: int64(100)}), metav1.CreateOptions{})
 	require.NoError(t, err)
 	expectChange("a new vlan")
+
+	nodes := p.dynamicClient.Resource(nodeGVR)
+	node, err := nodes.Get(ctx, testNode, metav1.GetOptions{})
+	require.NoError(t, err)
+	node.SetLabels(map[string]string{publisher.ReadyLabel(testOther): labelTrue})
+	node, err = nodes.Update(ctx, node, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	expectChange("a provider network becoming ready on the node")
+	node.Object[fieldStatus] = map[string]interface{}{fieldPhase: "Running"}
+	_, err = nodes.Update(ctx, node, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	expectNoChange("a node status update")
+}
+
+func TestSubnetMTU(t *testing.T) {
+	node := testNodeObject(testProviderNetwork)
+	node.SetLabels(map[string]string{fmt.Sprintf(providerNetworkMTULabel, testProviderNetwork): testUnderlayMTU})
+	p := newTestProfile(node,
+		kubeOVNObject(kindVlan, testVlan, map[string]interface{}{fieldID: int64(100), fieldProvider: testProviderNetwork}),
+		kubeOVNObject(kindVlan, testVlanNoPN, map[string]interface{}{fieldID: int64(101)}),
+		kubeOVNObject(kindVlan, testVlanOtherPN, map[string]interface{}{fieldID: int64(102), fieldProvider: testOther}),
+		kubeOVNObject(kindSubnet, testFixedMTUSubnet, map[string]interface{}{fieldProvider: testProvider, fieldMTU: int64(1300)}),
+		kubeOVNObject(kindSubnet, testFloatMTUSubnet, map[string]interface{}{fieldProvider: testProvider, fieldMTU: float64(1200)}),
+		kubeOVNObject(kindSubnet, testOverlaySubnet, subnetSpec(testProvider)),
+		kubeOVNObject(kindSubnet, testUnderlaySubnet, subnetSpec(testVlanProvider, fieldVlan, testVlan)),
+		kubeOVNObject(kindSubnet, testLogicalGatewaySubnet, map[string]interface{}{fieldProvider: testVlanProvider, fieldVlan: testVlan, fieldLogicalGateway: true}),
+		kubeOVNObject(kindSubnet, testMissingVlanSubnet, subnetSpec(testVlanProvider, fieldVlan, testMissingVlan)),
+		kubeOVNObject(kindSubnet, testNoPNSubnet, subnetSpec(testVlanProvider, fieldVlan, testVlanNoPN)),
+		kubeOVNObject(kindSubnet, testNoMTULabelSubnet, subnetSpec(testVlanProvider, fieldVlan, testVlanOtherPN)),
+	)
+	tests := []struct {
+		name    string
+		subnet  string
+		want    int
+		wantErr bool
+	}{
+		{"mtu of the subnet", testFixedMTUSubnet, 1300, false},
+		{"mtu of the subnet decoded as float", testFloatMTUSubnet, 1200, false},
+		{"overlay takes the pod's eth0", testOverlaySubnet, 0, false},
+		{"underlay takes the provider network's mtu", testUnderlaySubnet, 9000, false},
+		{"logical gateway is routed like overlay", testLogicalGatewaySubnet, 0, false},
+		{"vlan without provider network", testNoPNSubnet, 0, false},
+		{"provider network without mtu label", testNoMTULabelSubnet, 0, false},
+		{"missing vlan", testMissingVlanSubnet, 0, true},
+		{"missing subnet", testMissingSubnet, 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := p.SubnetMTU(context.Background(), tt.subnet)
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	t.Run("invalid mtu label", func(t *testing.T) {
+		node := testNodeObject(testProviderNetwork)
+		node.SetLabels(map[string]string{fmt.Sprintf(providerNetworkMTULabel, testProviderNetwork): testInvalidMTU})
+		p := newTestProfile(node,
+			kubeOVNObject(kindVlan, testVlan, map[string]interface{}{fieldID: int64(100), fieldProvider: testProviderNetwork}),
+			kubeOVNObject(kindSubnet, testUnderlaySubnet, subnetSpec(testVlanProvider, fieldVlan, testVlan)),
+		)
+		_, err := p.SubnetMTU(context.Background(), testUnderlaySubnet)
+		assert.ErrorContains(t, err, testInvalidMTU)
+	})
+}
+
+func TestSubnetOVNDHCP(t *testing.T) {
+	p := newTestProfile(testNodeObject(testProviderNetwork),
+		kubeOVNObject(kindSubnet, testOVNDHCPSubnet, map[string]interface{}{fieldProvider: testProvider, fieldEnableDHCP: true}),
+		kubeOVNObject(kindSubnet, testOverlaySubnet, subnetSpec(testProvider)),
+	)
+	enabled, err := p.SubnetOVNDHCP(context.Background(), testOVNDHCPSubnet)
+	require.NoError(t, err)
+	assert.True(t, enabled, "spec.enableDHCP")
+	enabled, err = p.SubnetOVNDHCP(context.Background(), testOverlaySubnet)
+	require.NoError(t, err)
+	assert.False(t, enabled, "no spec.enableDHCP")
+	_, err = p.SubnetOVNDHCP(context.Background(), testMissingSubnet)
+	assert.Error(t, err)
 }

@@ -23,15 +23,21 @@ import (
 	drapbv1 "k8s.io/kubelet/pkg/apis/dra/v1beta1"
 )
 
+// Values shared by the tests of this package.
+const (
+	testDevice1 = "dev1"
+	testDevice2 = "dev2"
+)
+
 func TestPreparedDevicesGetDevices(t *testing.T) {
 	if got := PreparedDevices(nil).GetDevices(); got != nil {
 		t.Errorf("GetDevices() of nil = %v, want nil", got)
 	}
 	devices := PreparedDevices{
-		{Device: drapbv1.Device{DeviceName: "dev1"}},
-		{Device: drapbv1.Device{DeviceName: "dev2"}},
+		{Device: drapbv1.Device{DeviceName: testDevice1}},
+		{Device: drapbv1.Device{DeviceName: testDevice2}},
 	}.GetDevices()
-	if len(devices) != 2 || devices[0].DeviceName != "dev1" || devices[1].DeviceName != "dev2" {
+	if len(devices) != 2 || devices[0].DeviceName != testDevice1 || devices[1].DeviceName != testDevice2 {
 		t.Errorf("GetDevices() = %v, want dev1 and dev2 in order", devices)
 	}
 }

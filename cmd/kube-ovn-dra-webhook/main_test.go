@@ -39,6 +39,11 @@ import (
 	"github.com/soer3n/kube-ovn-dra-driver/internal/profiles/nic"
 )
 
+// Values shared by the tests of this package.
+const (
+	testKindResourceClaim = "ResourceClaim"
+)
+
 const driverName = "nic.kubeovn.io"
 
 func TestReadyEndpoint(t *testing.T) {
@@ -157,7 +162,7 @@ func TestResourceClaimValidatingWebhook(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Equal(t, test.expectedAllowed, responseAdmissionReview.Response.Allowed)
 			if !test.expectedAllowed && test.expectMessageSubstr != "" {
-				assert.Contains(t, string(responseAdmissionReview.Response.Result.Message), test.expectMessageSubstr)
+				assert.Contains(t, responseAdmissionReview.Response.Result.Message, test.expectMessageSubstr)
 			}
 		})
 	}
@@ -180,7 +185,7 @@ func resourceClaimWithNicConfigs(nicConfigs ...*configapi.NicConfig) *resourceap
 	resourceClaim := &resourceapi.ResourceClaim{
 		Spec: resourceClaimSpecWithNicConfigs(nicConfigs...),
 	}
-	resourceClaim.SetGroupVersionKind(resourceapi.SchemeGroupVersion.WithKind("ResourceClaim"))
+	resourceClaim.SetGroupVersionKind(resourceapi.SchemeGroupVersion.WithKind(testKindResourceClaim))
 	return resourceClaim
 }
 
@@ -234,7 +239,7 @@ func resourceClaimWithRawConfig(raw []byte) *resourceapi.ResourceClaim {
 			},
 		},
 	}
-	resourceClaim.SetGroupVersionKind(resourceapi.SchemeGroupVersion.WithKind("ResourceClaim"))
+	resourceClaim.SetGroupVersionKind(resourceapi.SchemeGroupVersion.WithKind(testKindResourceClaim))
 	return resourceClaim
 }
 

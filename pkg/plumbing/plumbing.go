@@ -43,6 +43,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 )
 
@@ -65,6 +66,11 @@ const (
 // Spec is everything the attach step needs for ONE secondary NIC. It is built
 // in PrepareResourceClaims from the DRA device attributes + the kube-ovn IPAM
 // result, then consumed later by the NRI sandbox hook.
+//
+// The kubelet plugin's checkpoint stores it, and verifies its checksum over the
+// JSON the running version encodes. A field added later must therefore be
+// omitempty, so its zero value encodes like a checkpoint of an older version
+// that does not know the field.
 type Spec struct {
 	// --- identity (used as the NICStore key and for OVS external_ids) ---
 
@@ -96,10 +102,12 @@ type Spec struct {
 	// Gateway is the subnet gateway. Used for per-NIC routes ONLY — the default
 	// route belongs to eth0 and must never be touched (this is a secondary NIC).
 	Gateway string
-	// Routes are extra routes to install via this interface (CIDR strings).
-	// The subnet CIDR itself is added from IP; Gateway is not made default.
-	Routes []string
-	// MTU for the pod-side interface; 0 means inherit the bridge/default.
+	// Routes are extra routes to install via this interface, from kube-ovn's
+	// routes annotation of the NIC. The subnet CIDR itself is added from IP;
+	// Gateway is not made default.
+	Routes []Route
+	// MTU for the pod-side interface; 0 means the MTU of the pod's primary
+	// interface eth0, which kube-ovn-cni set for the overlay.
 	MTU int
 
 	// ContainerID is the sandbox container ID (from the NRI event). Used to
@@ -128,6 +136,52 @@ type Spec struct {
 	// (kube-ovn-network-binding-plugin) already expects as its domain XML
 	// target — no change needed on that side.
 	KubeVirtVMI bool
+
+	// OVNDHCP marks a NIC whose Subnet has OVN's DHCP enabled
+	// (spec.enableDHCP): the guest of a VMI then takes its addresses from OVN,
+	// IPv6 too with spec.enableIPv6RA, and the driver starts no DHCP server for
+	// it. OVN's DHCP options are per Subnet, so the NIC's routes annotation does
+	// not reach the guest then.
+	OVNDHCP bool `json:",omitempty"`
+}
+
+// Route is an extra route of a NIC, in the format of kube-ovn's routes
+// annotation. Without a gateway it goes via Spec.Gateway if that is of the same
+// IP family, and is on-link otherwise.
+type Route struct {
+	Destination string `json:"dst"`
+	Gateway     string `json:"gw,omitempty"`
+}
+
+// parse returns the destination and the gateway of the route. defaultGateway
+// is used when the route has none and it is of the destination's family.
+// A default route is refused: it belongs to eth0, never to a secondary NIC.
+func (r Route) parse(defaultGateway string) (*net.IPNet, net.IP, error) {
+	_, dst, err := net.ParseCIDR(r.Destination)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse route destination %q: %w", r.Destination, err)
+	}
+	if ones, _ := dst.Mask.Size(); ones == 0 {
+		return nil, nil, fmt.Errorf("refusing to install default route %q on a secondary NIC", r.Destination)
+	}
+	gateway := r.Gateway
+	if gateway == "" {
+		gateway = defaultGateway
+	}
+	if gateway == "" {
+		return dst, nil, nil
+	}
+	gw := net.ParseIP(gateway)
+	if gw == nil {
+		return nil, nil, fmt.Errorf("parse gateway %q of route %q", gateway, r.Destination)
+	}
+	if (gw.To4() != nil) != (dst.IP.To4() != nil) {
+		if r.Gateway != "" {
+			return nil, nil, fmt.Errorf("gateway %q of route %q is of another IP family", r.Gateway, r.Destination)
+		}
+		return dst, nil, nil
+	}
+	return dst, gw, nil
 }
 
 // Validate checks that the fields required for an attach are present.
@@ -167,19 +221,29 @@ type Attacher interface {
 // ovsAttacher is the kube-ovn / OVS implementation of Attacher.
 type ovsAttacher struct {
 	// dhcpServers tracks the per-VMI single-client DHCP servers started by
-	// ensureVMIDHCPServer, keyed by bridge name (globally unique — see
-	// shortHashName). This is in-process state, unlike everything else in
-	// this package: it does not survive a driver restart, only a running
+	// ensureVMIDHCPServer, one per NIC, keyed by the pod sandbox's netns and the
+	// NIC's bridge (see dhcpKey). This is in-process state, unlike everything
+	// else in this package: it does not survive a driver restart, only a running
 	// process's lifetime, matching KubeVirt's own per-launcher-process DHCP
 	// server (this driver plays that same role for VMI secondary NICs, just
 	// for potentially many pods in one process instead of one per pod).
 	dhcpMu      sync.Mutex
-	dhcpServers map[string]dhcpServeCloser
+	dhcpServers map[dhcpKey]dhcpServeCloser
+}
+
+// dhcpKey identifies the DHCP server of one VMI NIC. A pod with several DRA NICs
+// has one netns and one bridge per NIC, so neither part is enough alone: the
+// netns by itself made the second NIC find the first NIC's server and never start
+// its own, and the bridge name by itself is identical across every pod instance
+// of the same VMI network (see ensureVMIDHCPServer).
+type dhcpKey struct {
+	netnsPath string
+	bridge    string
 }
 
 // NewOVSAttacher returns the default OVS-backed Attacher.
 func NewOVSAttacher() Attacher {
-	return &ovsAttacher{dhcpServers: make(map[string]dhcpServeCloser)}
+	return &ovsAttacher{dhcpServers: make(map[dhcpKey]dhcpServeCloser)}
 }
 
 // Attach is the high-level recipe; see the private helpers below. The ordering
@@ -193,6 +257,9 @@ func (a *ovsAttacher) Attach(ctx context.Context, spec Spec) error {
 	hostVeth, podVeth, err := a.vethNames(spec)
 	if err != nil {
 		return err
+	}
+	if spec.MTU == 0 {
+		spec.MTU = a.primaryMTU(ctx, spec.NetnsPath)
 	}
 
 	// 1. Create the veth pair on the host side.

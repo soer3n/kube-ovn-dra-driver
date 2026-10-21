@@ -24,6 +24,11 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
+// Values shared by the tests of this package.
+const (
+	testLoggingFormatJSON = "json"
+)
+
 const testKubeconfig = `apiVersion: v1
 kind: Config
 clusters:
@@ -98,11 +103,11 @@ func TestLoggingConfig(t *testing.T) {
 			t.Errorf("logging flags lack %q", want)
 		}
 	}
-	runApp(t, flags, "-v", "2", "--logging-format", "json")
+	runApp(t, flags, "-v", "2", "--logging-format", testLoggingFormatJSON)
 	if err := l.Apply(); err != nil {
 		t.Errorf("Apply() error = %v", err)
 	}
-	if got := l.config.Format; got != "json" {
+	if got := l.config.Format; got != testLoggingFormatJSON {
 		t.Errorf("logging format = %q, want json", got)
 	}
 }

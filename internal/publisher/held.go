@@ -17,8 +17,6 @@
 package publisher
 
 import (
-	"strings"
-
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -83,11 +81,12 @@ func ApplyHeld(subnets []Subnet, driver string, claims []*resourceapi.ResourceCl
 		}
 		perSubnet := make(map[string]*use)
 		for _, result := range claim.Status.Allocation.Devices.Results {
-			if result.Driver != driver || !strings.HasPrefix(result.Device, DeviceNamePrefix) {
+			if result.Driver != driver {
 				continue
 			}
-			subnet := byName[SubnetName(result.Device)]
-			if subnet == nil {
+			// Every Subnet is a pool of its own, named after the Subnet.
+			subnet := byName[result.Pool]
+			if subnet == nil || result.Device != DeviceName(subnet.Name) {
 				continue
 			}
 			u := perSubnet[subnet.Name]

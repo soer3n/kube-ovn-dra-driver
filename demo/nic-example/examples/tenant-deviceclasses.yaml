@@ -1,0 +1,67 @@
+# Per-tenant DeviceClasses: an admin creates one DeviceClass per tenant whose
+# selector only matches that tenant's subnets, here once by VPC (tenant-a has
+# its own VPC) and once by a list of subnet names (tenant-b's subnet is in the
+# default VPC). A claim through a tenant class only gets that tenant's subnets;
+# its own selectors can narrow that, never widen it.
+#
+# The classes do not control who may use them: any namespace can still name
+# another tenant's class or the generic nic.kubeovn.io class. Restrict that
+# with a ResourceQuota of 0 on those classes per tenant namespace
+# (<class>.deviceclass.resource.k8s.io/devices), see docs/nic-driver.md.
+#
+# The driver leaves vpc and provider out of a device whose Subnet has none, and
+# a CEL error fails the whole allocation instead of skipping the device, so
+# selectors read those attributes with .?<name>.orValue(''). subnetName is set
+# on every device.
+#
+#   kubectl apply -f demo/nic-example/examples/tenant-deviceclasses.yaml
+#   kubectl get deviceclasses
+---
+apiVersion: kubeovn.io/v1
+kind: Vpc
+metadata:
+  name: tenant-a
+spec: {}
+---
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: tenant-a-1
+spec:
+  vpc: tenant-a
+  protocol: IPv4
+  cidrBlock: 10.251.1.0/24
+  gateway: 10.251.1.1
+  provider: tenant-a-1.default.ovn
+---
+apiVersion: kubeovn.io/v1
+kind: Subnet
+metadata:
+  name: tenant-b-1
+spec:
+  protocol: IPv4
+  cidrBlock: 10.251.2.0/24
+  gateway: 10.251.2.1
+  provider: tenant-b-1.default.ovn
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: tenant-a.nic.kubeovn.io
+spec:
+  selectors:
+    - cel:
+        expression: >-
+          device.driver == 'nic.kubeovn.io' &&
+          device.attributes['nic.kubeovn.io'].?vpc.orValue('') == 'tenant-a'
+---
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: tenant-b.nic.kubeovn.io
+spec:
+  selectors:
+    - cel:
+        expression: >-
+          device.driver == 'nic.kubeovn.io' &&
+          device.attributes['nic.kubeovn.io'].subnetName in ['tenant-b-1']

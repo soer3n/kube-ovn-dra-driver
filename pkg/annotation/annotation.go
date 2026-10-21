@@ -54,10 +54,16 @@ const (
 	// the owning KubeVirt VM (keep-vm-ip) instead of after the pod.
 	tmplVM = "%s.kubernetes.io/virtualmachine"
 
-	// waitTimeout is the maximum time we wait for kube-ovn to respond.
-	waitTimeout  = 30 * time.Second
 	waitInterval = 500 * time.Millisecond
+
+	// tmplRoutes holds the extra routes of a NIC, a JSON list of
+	// {"dst": "<cidr>", "gw": "<ip>"}, as kube-ovn-cni reads it.
+	tmplRoutes = "%s.kubernetes.io/routes"
 )
+
+// WaitTimeout is the maximum time WaitForAllocation waits for kube-ovn. It is
+// set from the kubelet plugin's --allocation-timeout flag.
+var WaitTimeout = 30 * time.Second
 
 // AllocatedNIC holds the IPAM result written back by kube-ovn-controller.
 type AllocatedNIC struct {
@@ -77,17 +83,19 @@ type AllocatedNIC struct {
 	VMName string
 	// Provider is the annotation key prefix kube-ovn used for this NIC.
 	Provider string
+	// Routes is the raw routes annotation of the NIC, if any.
+	Routes string
 }
 
 // WaitForAllocation polls the pod until kube-ovn has written back the IPAM
 // result annotations for one of the providers (the first one found wins), or
 // until the context deadline is reached.
 func WaitForAllocation(ctx context.Context, client coreclientset.Interface, namespace, podName string, providers ...string) (*AllocatedNIC, error) {
-	ctx, cancel := context.WithTimeout(ctx, waitTimeout)
+	ctx, cancel := context.WithTimeout(ctx, WaitTimeout)
 	defer cancel()
 
 	var result *AllocatedNIC
-	err := wait.PollUntilContextTimeout(ctx, waitInterval, waitTimeout, true, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(ctx, waitInterval, WaitTimeout, true, func(ctx context.Context) (bool, error) {
 		pod, err := client.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
@@ -131,5 +139,6 @@ func extractAllocation(pod *corev1.Pod, provider string) (*AllocatedNIC, bool) {
 		SubnetName: ann[fmt.Sprintf(tmplLogicalSwitch, provider)],
 		VMName:     ann[fmt.Sprintf(tmplVM, provider)],
 		Provider:   provider,
+		Routes:     ann[fmt.Sprintf(tmplRoutes, provider)],
 	}, true
 }

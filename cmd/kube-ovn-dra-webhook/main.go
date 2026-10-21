@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/urfave/cli/v2"
 
@@ -113,7 +114,7 @@ func newApp() *cli.App {
 			}
 			return flags.loggingConfig.Apply()
 		},
-		Action: func(c *cli.Context) error {
+		Action: func(_ *cli.Context) error {
 			configHandler, ok := validProfiles[flags.profile]
 			if !ok {
 				var valid []string
@@ -133,8 +134,9 @@ func newApp() *cli.App {
 			}
 
 			server := &http.Server{
-				Handler: mux,
-				Addr:    fmt.Sprintf(":%d", flags.port),
+				Handler:           mux,
+				Addr:              fmt.Sprintf(":%d", flags.port),
+				ReadHeaderTimeout: readHeaderTimeout,
 			}
 			klog.Background().Info("starting webhook server", "addr", server.Addr)
 			return server.ListenAndServeTLS(flags.certFile, flags.keyFile)
@@ -165,7 +167,11 @@ func newMux(configHandler profiles.ConfigHandler, driverName string) (*http.Serv
 	return mux, nil
 }
 
-func readyHandler(w http.ResponseWriter, req *http.Request) {
+// readHeaderTimeout bounds how long a client may take to send the request
+// headers, so slow clients cannot hold connections open.
+const readHeaderTimeout = 10 * time.Second
+
+func readyHandler(w http.ResponseWriter, _ *http.Request) {
 	_, err := w.Write([]byte("ok"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -175,13 +181,13 @@ func readyHandler(w http.ResponseWriter, req *http.Request) {
 
 func serveResourceClaim(configDecoder runtime.Decoder, validate validator, driverName string) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		serve(w, r, r.Context(), admitResourceClaimParameters(configDecoder, validate, driverName))
+		serve(r.Context(), w, r, admitResourceClaimParameters(configDecoder, validate, driverName))
 	}
 }
 
 // serve handles the http portion of a request prior to handing to an admit
 // function.
-func serve(w http.ResponseWriter, r *http.Request, ctx context.Context, admit func(context.Context, admissionv1.AdmissionReview) *admissionv1.AdmissionResponse) {
+func serve(ctx context.Context, w http.ResponseWriter, r *http.Request, admit func(context.Context, admissionv1.AdmissionReview) *admissionv1.AdmissionResponse) {
 	logger := klog.FromContext(ctx)
 	var body []byte
 	if r.Body != nil {
@@ -329,7 +335,7 @@ func admitResourceClaimParameters(configDecoder runtime.Decoder, validate valida
 			return &admissionv1.AdmissionResponse{
 				Result: &metav1.Status{
 					Message: msg,
-					Reason:  metav1.StatusReason(metav1.StatusReasonInvalid),
+					Reason:  metav1.StatusReasonInvalid,
 				},
 			}
 		}

@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
 	coreclientset "k8s.io/client-go/kubernetes"
+	"k8s.io/dynamic-resource-allocation/resourceclaim"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	drapbv1 "k8s.io/kubelet/pkg/apis/dra/v1beta1"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
@@ -39,8 +40,10 @@ import (
 	"github.com/soer3n/kube-ovn-dra-driver/pkg/plumbing"
 )
 
-type AllocatableDevices map[string]resourceapi.Device
-type PreparedClaims map[string]profiles.PreparedDevices
+type (
+	AllocatableDevices map[string]resourceapi.Device
+	PreparedClaims     map[string]profiles.PreparedDevices
+)
 
 // maxPrepareConcurrency bounds how many NICs of a claim wait for their
 // kube-ovn allocation at once during PrepareResourceClaims, so prepare latency
@@ -69,27 +72,29 @@ type DeviceState struct {
 	// nicStore receives one plumbing.Spec per claimed NIC, so the NRI sandbox
 	// hooks can attach it once the netns exists.
 	nicStore *plumbing.NICStore
+	// annotateVMI records the MAC of a VM's NIC on its VMI; may be nil.
+	annotateVMI vmiAnnotator
 }
 
 func NewDeviceState(config *Config) (*DeviceState, error) {
 	driverResources, err := config.profile.EnumerateDevices()
 	if err != nil {
-		return nil, fmt.Errorf("error enumerating all possible devices: %v", err)
+		return nil, fmt.Errorf("error enumerating all possible devices: %w", err)
 	}
 
 	cdi, err := NewCDIHandler(config.flags.cdiRoot, config.flags.driverName, config.flags.profile)
 	if err != nil {
-		return nil, fmt.Errorf("unable to create CDI handler: %v", err)
+		return nil, fmt.Errorf("unable to create CDI handler: %w", err)
 	}
 
 	err = cdi.CreateCommonSpecFile()
 	if err != nil {
-		return nil, fmt.Errorf("unable to create CDI spec file for common edits: %v", err)
+		return nil, fmt.Errorf("unable to create CDI spec file for common edits: %w", err)
 	}
 
 	checkpointManager, err := checkpointmanager.NewCheckpointManager(config.DriverPluginPath())
 	if err != nil {
-		return nil, fmt.Errorf("unable to create checkpoint manager: %v", err)
+		return nil, fmt.Errorf("unable to create checkpoint manager: %w", err)
 	}
 
 	configScheme := runtime.NewScheme()
@@ -124,11 +129,12 @@ func NewDeviceState(config *Config) (*DeviceState, error) {
 		coreclient:        config.coreclient,
 		isNIC:             config.flags.profile == nicprofile.ProfileName,
 		nicStore:          config.nicStore,
+		annotateVMI:       config.annotateVMI,
 	}
 
 	checkpoints, err := state.checkpointManager.ListCheckpoints()
 	if err != nil {
-		return nil, fmt.Errorf("unable to list checkpoints: %v", err)
+		return nil, fmt.Errorf("unable to list checkpoints: %w", err)
 	}
 
 	for _, c := range checkpoints {
@@ -142,7 +148,7 @@ func NewDeviceState(config *Config) (*DeviceState, error) {
 
 	checkpoint := newCheckpoint()
 	if err := state.checkpointManager.CreateCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
-		return nil, fmt.Errorf("unable to sync to checkpoint: %v", err)
+		return nil, fmt.Errorf("unable to sync to checkpoint: %w", err)
 	}
 
 	return state, nil
@@ -156,7 +162,7 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 
 	checkpoint := newCheckpoint()
 	if err := s.checkpointManager.GetCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
-		return nil, fmt.Errorf("unable to sync from checkpoint: %v", err)
+		return nil, fmt.Errorf("unable to sync from checkpoint: %w", err)
 	}
 	preparedClaims := checkpoint.V1.PreparedClaims
 
@@ -165,16 +171,16 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 	}
 	preparedDevices, err := s.prepareDevices(ctx, claim)
 	if err != nil {
-		return nil, fmt.Errorf("prepare failed: %v", err)
+		return nil, fmt.Errorf("prepare failed: %w", err)
 	}
 
 	if err = s.cdi.CreateClaimSpecFile(claimUID, preparedDevices); err != nil {
-		return nil, fmt.Errorf("unable to create CDI spec file for claim: %v", err)
+		return nil, fmt.Errorf("unable to create CDI spec file for claim: %w", err)
 	}
 
 	preparedClaims[claimUID] = preparedDevices
 	if err := s.checkpointManager.CreateCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
-		return nil, fmt.Errorf("unable to sync to checkpoint: %v", err)
+		return nil, fmt.Errorf("unable to sync to checkpoint: %w", err)
 	}
 
 	return preparedClaims[claimUID].GetDevices(), nil
@@ -188,7 +194,7 @@ func (s *DeviceState) Unprepare(claimUID string) error {
 	if err := s.checkpointManager.GetCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
 		checkpoint = newCheckpoint()
 		if err := s.checkpointManager.CreateCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
-			return fmt.Errorf("unable to create new checkpoint: %v", err)
+			return fmt.Errorf("unable to create new checkpoint: %w", err)
 		}
 	}
 	preparedClaims := checkpoint.V1.PreparedClaims
@@ -198,17 +204,17 @@ func (s *DeviceState) Unprepare(claimUID string) error {
 	}
 
 	if err := s.unprepareDevices(claimUID, preparedClaims[claimUID]); err != nil {
-		return fmt.Errorf("unprepare failed: %v", err)
+		return fmt.Errorf("unprepare failed: %w", err)
 	}
 
 	err := s.cdi.DeleteClaimSpecFile(claimUID)
 	if err != nil {
-		return fmt.Errorf("unable to delete CDI spec file for claim: %v", err)
+		return fmt.Errorf("unable to delete CDI spec file for claim: %w", err)
 	}
 
 	delete(preparedClaims, claimUID)
 	if err := s.checkpointManager.CreateCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
-		return fmt.Errorf("unable to sync to checkpoint: %v", err)
+		return fmt.Errorf("unable to sync to checkpoint: %w", err)
 	}
 
 	return nil
@@ -216,43 +222,14 @@ func (s *DeviceState) Unprepare(claimUID string) error {
 
 func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.ResourceClaim) (profiles.PreparedDevices, error) {
 	if claim.Status.Allocation == nil {
-		return nil, fmt.Errorf("claim not yet allocated")
+		return nil, errors.New("claim not yet allocated")
 	}
 	// Check if any device request has admin access
 	hasAdminAccess := s.checkAdminAccess(claim)
 
-	// Retrieve the full set of device configs for the driver.
-	configs, err := GetOpaqueDeviceConfigs(
-		s.configDecoder,
-		s.driverName,
-		claim.Status.Allocation.Devices.Config,
-	)
+	configResultsMap, err := s.resultsByConfig(claim)
 	if err != nil {
-		return nil, fmt.Errorf("error getting opaque device configs: %v", err)
-	}
-
-	// Add the default device Config to the front of the config list with the
-	// lowest precedence. This guarantees there will be at least one config in
-	// the list with len(Requests) == 0 for the lookup below.
-	configs = slices.Insert(configs, 0, &OpaqueDeviceConfig{})
-
-	// Look through the configs and figure out which one will be applied to
-	// each device allocation result based on their order of precedence.
-	configResultsMap := make(map[runtime.Object][]*resourceapi.DeviceRequestAllocationResult)
-	for _, result := range claim.Status.Allocation.Devices.Results {
-		// The claim may include allocations meant for other drivers.
-		if result.Driver != s.driverName {
-			continue
-		}
-		if _, exists := s.allocatable[result.Device]; !exists {
-			return nil, fmt.Errorf("requested device is not allocatable: %v", result.Device)
-		}
-		for _, c := range slices.Backward(configs) {
-			if len(c.Requests) == 0 || slices.Contains(c.Requests, result.Request) {
-				configResultsMap[c.Config] = append(configResultsMap[c.Config], &result)
-				break
-			}
-		}
+		return nil, err
 	}
 
 	// Apply all configs associated with devices that need to be prepared.
@@ -275,10 +252,6 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 	// Flatten configResultsMap into an ordered list of (result, ifaceName) items.
 	// Map iteration order isn't stable, so fix it into a slice before doing the
 	// concurrent IPAM below and the (order-sensitive) device build after.
-	type prepItem struct {
-		result    *resourceapi.DeviceRequestAllocationResult
-		ifaceName string
-	}
 	var items []prepItem
 	for cfg, results := range configResultsMap {
 		// Determine interface name from NicConfig for this batch.
@@ -302,31 +275,9 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 		}
 	}
 
-	// Waiting for kube-ovn-controller's allocation is the slow step. Wait for all
-	// claimed NICs concurrently so prepare latency is ~one round-trip instead of N.
 	nicCfgs := make([]*nicprepare.NicDeviceConfig, len(items))
 	if s.isNIC {
-		itemErrs := make([]error, len(items))
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, maxPrepareConcurrency)
-		for i := range items {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-				it := items[i]
-				dev := s.allocatable[it.result.Device]
-				cfg, err := nicprepare.RequestIPAM(ctx, s.coreclient, claim, it.result, dev, it.ifaceName)
-				if err != nil {
-					itemErrs[i] = fmt.Errorf("NIC IPAM for device %s: %w", it.result.Device, err)
-					return
-				}
-				nicCfgs[i] = cfg
-			}(i)
-		}
-		wg.Wait()
-		if err := errors.Join(itemErrs...); err != nil {
+		if nicCfgs, err = s.resolveNICs(ctx, claim, items); err != nil {
 			return nil, err
 		}
 	}
@@ -364,6 +315,129 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 	}
 
 	return preparedDevices, nil
+}
+
+// mtuResolver is implemented by profiles that know the MTU of a subnet.
+type mtuResolver interface {
+	SubnetMTU(ctx context.Context, subnet string) (int, error)
+}
+
+// subnetMTU returns the MTU of a NIC on the subnet, or 0 to let the attach take
+// the MTU of the pod's primary interface.
+func (s *DeviceState) subnetMTU(ctx context.Context, subnet string) (int, error) {
+	if resolver, ok := s.profile.(mtuResolver); ok {
+		return resolver.SubnetMTU(ctx, subnet)
+	}
+	return 0, nil
+}
+
+// dhcpResolver is implemented by profiles that know whether a subnet has OVN's
+// DHCP enabled.
+type dhcpResolver interface {
+	SubnetOVNDHCP(ctx context.Context, subnet string) (bool, error)
+}
+
+// subnetOVNDHCP reports whether the subnet has OVN's DHCP enabled, in which
+// case a VM's guest takes its addresses from OVN instead of the driver.
+func (s *DeviceState) subnetOVNDHCP(ctx context.Context, subnet string) (bool, error) {
+	if resolver, ok := s.profile.(dhcpResolver); ok {
+		return resolver.SubnetOVNDHCP(ctx, subnet)
+	}
+	return false, nil
+}
+
+// resultsByConfig groups the claim's allocation results of the driver by the
+// config that applies to them: the claim's or class's config with the highest
+// precedence, or the default config.
+func (s *DeviceState) resultsByConfig(claim *resourceapi.ResourceClaim) (map[runtime.Object][]*resourceapi.DeviceRequestAllocationResult, error) {
+	// Retrieve the full set of device configs for the driver.
+	configs, err := GetOpaqueDeviceConfigs(
+		s.configDecoder,
+		s.driverName,
+		claim.Status.Allocation.Devices.Config,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error getting opaque device configs: %w", err)
+	}
+
+	// Add the default device Config to the front of the config list with the
+	// lowest precedence. This guarantees there will be at least one config in
+	// the list with len(Requests) == 0 for the lookup below.
+	configs = slices.Insert(configs, 0, &OpaqueDeviceConfig{})
+
+	// Look through the configs and figure out which one will be applied to
+	// each device allocation result based on their order of precedence.
+	configResultsMap := make(map[runtime.Object][]*resourceapi.DeviceRequestAllocationResult)
+	for _, result := range claim.Status.Allocation.Devices.Results {
+		// The claim may include allocations meant for other drivers.
+		if result.Driver != s.driverName {
+			continue
+		}
+		if _, exists := s.allocatable[result.Device]; !exists {
+			return nil, fmt.Errorf("requested device is not allocatable: %v", result.Device)
+		}
+		for _, c := range slices.Backward(configs) {
+			if configMatchesRequest(c.Requests, result.Request) {
+				configResultsMap[c.Config] = append(configResultsMap[c.Config], &result)
+				break
+			}
+		}
+	}
+	return configResultsMap, nil
+}
+
+// prepItem is an allocation result of the driver with the interface name its
+// config gives it.
+type prepItem struct {
+	result    *resourceapi.DeviceRequestAllocationResult
+	ifaceName string
+}
+
+// resolveNICs resolves the kube-ovn allocation of every NIC of a claim.
+// Waiting for kube-ovn-controller's allocation is the slow step, so the NICs
+// are resolved concurrently: prepare latency is ~one round-trip instead of N.
+func (s *DeviceState) resolveNICs(ctx context.Context, claim *resourceapi.ResourceClaim, items []prepItem) ([]*nicprepare.NicDeviceConfig, error) {
+	nicCfgs := make([]*nicprepare.NicDeviceConfig, len(items))
+	itemErrs := make([]error, len(items))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxPrepareConcurrency)
+	for i := range items {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			nicCfgs[i], itemErrs[i] = s.resolveNIC(ctx, claim, items[i])
+		}(i)
+	}
+	wg.Wait()
+	if err := errors.Join(itemErrs...); err != nil {
+		return nil, err
+	}
+	return nicCfgs, nil
+}
+
+// resolveNIC waits for the kube-ovn allocation of one NIC and adds its MTU and
+// whether OVN serves its DHCP.
+func (s *DeviceState) resolveNIC(ctx context.Context, claim *resourceapi.ResourceClaim, it prepItem) (*nicprepare.NicDeviceConfig, error) {
+	cfg, err := nicprepare.RequestIPAM(ctx, s.coreclient, claim, it.result, s.allocatable[it.result.Device], it.ifaceName, s.nodeName)
+	if err != nil {
+		return nil, fmt.Errorf("NIC IPAM for device %s: %w", it.result.Device, err)
+	}
+	if cfg.MTU, err = s.subnetMTU(ctx, cfg.SubnetName); err != nil {
+		return nil, fmt.Errorf("MTU of NIC %s: %w", it.ifaceName, err)
+	}
+	if cfg.OVNDHCP, err = s.subnetOVNDHCP(ctx, cfg.SubnetName); err != nil {
+		return nil, fmt.Errorf("DHCP of NIC %s: %w", it.ifaceName, err)
+	}
+	if s.annotateVMI != nil && cfg.VMName != "" {
+		// Before the launcher starts, so the domain definition sees it.
+		annotations := map[string]string{vmiMACAnnotationPrefix + cfg.IfaceName: cfg.MAC}
+		if err := s.annotateVMI(ctx, cfg.PodNamespace, cfg.VMName, annotations); err != nil {
+			return nil, fmt.Errorf("record the MAC of NIC %s on VMI %s/%s: %w", it.ifaceName, cfg.PodNamespace, cfg.VMName, err)
+		}
+	}
+	return cfg, nil
 }
 
 // unprepareDevices forgets the claim's NICs. Nothing is released:
@@ -443,7 +517,7 @@ func (s *DeviceState) restoreNICs() error {
 	}
 	checkpoint := newCheckpoint()
 	if err := s.checkpointManager.GetCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
-		return fmt.Errorf("unable to sync from checkpoint: %v", err)
+		return fmt.Errorf("unable to sync from checkpoint: %w", err)
 	}
 	for _, devices := range checkpoint.V1.PreparedClaims {
 		for _, device := range devices {
@@ -473,7 +547,20 @@ func nicSpecFromConfig(cfg *nicprepare.NicDeviceConfig) plumbing.Spec {
 		Gateway:      cfg.Gateway,
 		Provider:     cfg.Provider,
 		IfaceID:      cfg.LogicalSwitchPort,
+		Routes:       cfg.Routes,
+		MTU:          cfg.MTU,
+		OVNDHCP:      cfg.OVNDHCP,
 	}
+}
+
+// configMatchesRequest reports whether a config with the given requests
+// applies to an allocation result. A config naming a request also applies to
+// the subrequest firstAvailable picked for it ("network" for "network/vlan"),
+// the rule of resourceclaim.ConfigForResult, which kube-ovn-controller uses to
+// find the interface name.
+func configMatchesRequest(requests []string, request string) bool {
+	return len(requests) == 0 || slices.Contains(requests, request) ||
+		slices.Contains(requests, resourceclaim.BaseRequestRef(request))
 }
 
 // checkAdminAccess determines if a resource claim requires admin access.
@@ -527,7 +614,7 @@ func GetOpaqueDeviceConfigs(
 		// If this is nil, the driver doesn't support some future API extension
 		// and needs to be updated.
 		if config.Opaque == nil {
-			return nil, fmt.Errorf("only opaque parameters are supported by this driver")
+			return nil, errors.New("only opaque parameters are supported by this driver")
 		}
 
 		// Configs for different drivers may have been specified because a

@@ -38,10 +38,10 @@ import (
 
 func object(kind, name string, spec, status map[string]any) *unstructured.Unstructured {
 	obj := map[string]any{
-		"apiVersion": "kubeovn.io/v1",
-		"kind":       kind,
-		"metadata":   map[string]any{"name": name},
-		"spec":       spec,
+		fieldAPIVersion: kubeOVNAPIVersion,
+		fieldKind:       kind,
+		fieldMetadata:   map[string]any{fieldName: name},
+		fieldSpec:       spec,
 	}
 	if status != nil {
 		obj["status"] = status
@@ -63,30 +63,31 @@ func ownersAsPods(_, pod string) []string { return []string{pod} }
 func testSnapshotter(t *testing.T, capacity bool, claims ...any) *snapshotter {
 	t.Helper()
 	return &snapshotter{
-		driverName: "nic.kubeovn.io",
+		driverName: testDriver,
 		capacity:   capacity,
 		subnets: storeOf(t,
-			object("Subnet", "ovn-subnet", map[string]any{"cidrBlock": "10.200.0.0/24", "provider": "ovn-subnet.default.ovn"},
-				map[string]any{"v4availableIPs": int64(8)}),
-			object("Subnet", "vlan100-subnet", map[string]any{"cidrBlock": "172.23.0.0/24", "vlan": "vlan100"},
-				map[string]any{"v4availableIPs": int64(100)}),
-			object("Subnet", "orphan", map[string]any{"cidrBlock": "10.9.0.0/24", "vlan": "not-there-yet"}, nil),
-			object("Subnet", "no-spec", nil, nil),
+			object(kindSubnet, testOverlaySubnet, map[string]any{fieldCIDRBlock: "10.200.0.0/24", fieldProvider: testOverlayProvider},
+				map[string]any{fieldV4Available: int64(8)}),
+			object(kindSubnet, testVlanSubnet, map[string]any{fieldCIDRBlock: "172.23.0.0/24", fieldVlan: testVlan, fieldProvider: testVlanSubnetProvider},
+				map[string]any{fieldV4Available: int64(100)}),
+			object(kindSubnet, "orphan", map[string]any{fieldCIDRBlock: "10.9.0.0/24", fieldVlan: "not-there-yet"}, nil),
+			object(kindSubnet, "no-spec", nil, nil),
+			object(kindSubnet, "default-provider", map[string]any{fieldCIDRBlock: "10.8.0.0/24"}, nil),
 		),
-		vlans: storeOf(t, object("Vlan", "vlan100", map[string]any{"id": int64(100), "provider": "external"}, nil)),
+		vlans: storeOf(t, object(kindVlan, testVlan, map[string]any{fieldID: int64(100), fieldProvider: "external"}, nil)),
 		ips: storeOf(t,
-			object("IP", "pod-a.default.ovn-subnet.default.ovn", map[string]any{"podName": "pod-a", "namespace": "default", "subnet": "ovn-subnet"}, nil)),
+			object(kindIP, "pod-a.default.ovn-subnet.default.ovn", map[string]any{fieldPodName: testPodA, fieldNamespace: testNS, fieldSubnet: testOverlaySubnet}, nil)),
 		claims: storeOf(t, claims...),
 		owners: ownersAsPods,
 	}
 }
 
 func allocated(name, pod, device string) *resourceapi.ResourceClaim {
-	c := &resourceapi.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name}}
-	c.Status.ReservedFor = []resourceapi.ResourceClaimConsumerReference{{Resource: "pods", Name: pod}}
+	c := &resourceapi.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: name}}
+	c.Status.ReservedFor = []resourceapi.ResourceClaimConsumerReference{{Resource: podsResource, Name: pod}}
 	c.Status.Allocation = &resourceapi.AllocationResult{Devices: resourceapi.DeviceAllocationResult{
 		Results: []resourceapi.DeviceRequestAllocationResult{{
-			Driver: "nic.kubeovn.io", Pool: "ovn-subnet", Device: device, Request: "nic",
+			Driver: testDriver, Pool: testOverlaySubnet, Device: device, Request: "nic",
 			ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{publisher.CapacityIPv4: resource.MustParse("1")},
 		}},
 	}}
@@ -97,12 +98,12 @@ func TestSnapshotPoolsPerSubnetWithScope(t *testing.T) {
 	resources, err := testSnapshotter(t, false).resources()
 	require.NoError(t, err)
 
-	require.Len(t, resources.Pools, 2, "the Subnet whose Vlan is not there yet and the one without spec are left out")
-	overlay, ok := resources.Pools["ovn-subnet"]
+	require.Len(t, resources.Pools, 2, "the Subnets whose Vlan is not there yet, without spec or with the default provider are left out")
+	overlay, ok := resources.Pools[testOverlaySubnet]
 	require.True(t, ok, "a pool is named after its Subnet")
 	assert.Nil(t, overlay.NodeSelector)
 
-	vlan, ok := resources.Pools["vlan100-subnet"]
+	vlan, ok := resources.Pools[testVlanSubnet]
 	require.True(t, ok)
 	require.NotNil(t, vlan.NodeSelector)
 	assert.Equal(t, "external.provider-network.kubernetes.io/ready", vlan.NodeSelector.NodeSelectorTerms[0].MatchExpressions[0].Key)
@@ -112,19 +113,19 @@ func TestSnapshotPoolsPerSubnetWithScope(t *testing.T) {
 func TestSnapshotCapacityIsFreeAddressesPlusHeldClaims(t *testing.T) {
 	// pod-a has its address (the ip object exists), pod-b is allocated and waits for its address.
 	s := testSnapshotter(t, true,
-		allocated("claim-a", "pod-a", "subnet-ovn-subnet"),
-		allocated("claim-b", "pod-b", "subnet-ovn-subnet"),
+		allocated("claim-a", testPodA, testOverlayDevice),
+		allocated("claim-b", "pod-b", testOverlayDevice),
 	)
 
 	resources, err := s.resources()
 	require.NoError(t, err)
 
-	device := resources.Pools["ovn-subnet"].Slices[0].Devices[0]
+	device := resources.Pools[testOverlaySubnet].Slices[0].Devices[0]
 	v4 := device.Capacity[publisher.CapacityIPv4]
 	assert.Equal(t, int64(9), v4.Value.Value(), "8 free + 1 claim that already has its address")
 	assert.NotContains(t, device.Capacity, publisher.CapacityIPv6)
 
-	vlan := resources.Pools["vlan100-subnet"].Slices[0].Devices[0].Capacity[publisher.CapacityIPv4]
+	vlan := resources.Pools[testVlanSubnet].Slices[0].Devices[0].Capacity[publisher.CapacityIPv4]
 	assert.Equal(t, int64(100), vlan.Value.Value())
 }
 
@@ -139,21 +140,21 @@ func TestSnapshotIsStableBetweenCalls(t *testing.T) {
 
 func TestPodOwnersAddsTheVMOfALauncherPod(t *testing.T) {
 	launcher := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "default", Name: "virt-launcher-vm-1-abcde", Labels: map[string]string{"vm.kubevirt.io/name": "vm-1"},
+		Namespace: testNS, Name: testVMLauncher, Labels: map[string]string{"vm.kubevirt.io/name": testVM},
 	}}
-	client := fake.NewSimpleClientset(launcher, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "plain"}})
+	client := fake.NewSimpleClientset(launcher, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: testPlainPod}})
 	owners := newPodOwners(client)
 
-	assert.Equal(t, []string{"virt-launcher-vm-1-abcde", "vm-1"}, owners("default", "virt-launcher-vm-1-abcde"))
-	assert.Equal(t, []string{"plain"}, owners("default", "plain"))
-	assert.Equal(t, []string{"gone"}, owners("default", "gone"), "a pod that is gone is only known by its own name")
+	assert.Equal(t, []string{testVMLauncher, testVM}, owners(testNS, testVMLauncher))
+	assert.Equal(t, []string{testPlainPod}, owners(testNS, testPlainPod))
+	assert.Equal(t, []string{testGonePod}, owners(testNS, testGonePod), "a pod that is gone is only known by its own name")
 }
 
 func TestPodOwnersCachesAnswersButNotFailures(t *testing.T) {
-	client := fake.NewSimpleClientset(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pod"}})
+	client := fake.NewSimpleClientset(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: testPlainPod}})
 	gets := 0
 	failing := true
-	client.PrependReactor("get", "pods", func(clienttesting.Action) (bool, runtime.Object, error) {
+	client.PrependReactor(verbGet, podsResource, func(clienttesting.Action) (bool, runtime.Object, error) {
 		gets++
 		if failing {
 			return true, nil, errors.New("apiserver unavailable")
@@ -162,27 +163,34 @@ func TestPodOwnersCachesAnswersButNotFailures(t *testing.T) {
 	})
 	owners := newPodOwners(client)
 
-	assert.Equal(t, []string{"pod"}, owners("default", "pod"), "a failure still returns the pod's own name")
-	assert.Equal(t, []string{"pod"}, owners("default", "pod"))
+	assert.Equal(t, []string{testPlainPod}, owners(testNS, testPlainPod), "a failure still returns the pod's own name")
+	assert.Equal(t, []string{testPlainPod}, owners(testNS, testPlainPod))
 	assert.Equal(t, 2, gets, "a failure is not cached")
 
 	failing = false
-	owners("default", "pod")
-	owners("default", "pod")
+	owners(testNS, testPlainPod)
+	owners(testNS, testPlainPod)
 	assert.Equal(t, 3, gets, "a successful answer is cached")
 }
 
 func TestRunPublisherIfRequestedIgnoresOtherArguments(t *testing.T) {
-	started, err := runPublisherIfRequested([]string{"kube-ovn-dra-kubeletplugin"})
+	started, err := runPublisherIfRequested([]string{pluginBinary})
 	assert.False(t, started)
 	assert.NoError(t, err)
 
-	started, err = runPublisherIfRequested([]string{"kube-ovn-dra-kubeletplugin", "--node-name=n"})
+	started, err = runPublisherIfRequested([]string{pluginBinary, testNodeNameFlag})
 	assert.False(t, started)
 	assert.NoError(t, err)
 }
 
+func TestPluginRejectsANonPositiveAllocationTimeout(t *testing.T) {
+	for _, timeout := range []string{"0s", "-1s"} {
+		err := newApp().RunContext(context.Background(), []string{pluginBinary, testNodeNameFlag, "--allocation-timeout=" + timeout})
+		assert.ErrorContains(t, err, "allocation timeout must be positive")
+	}
+}
+
 func TestPluginRejectsAnInvalidPublishMode(t *testing.T) {
-	err := newApp().RunContext(context.Background(), []string{"kube-ovn-dra-kubeletplugin", "--node-name=n", "--publish-mode=everywhere"})
+	err := newApp().RunContext(context.Background(), []string{pluginBinary, testNodeNameFlag, "--publish-mode=everywhere"})
 	assert.ErrorContains(t, err, `invalid publish mode "everywhere"`)
 }

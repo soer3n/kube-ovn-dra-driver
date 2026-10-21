@@ -71,8 +71,10 @@ var (
 	}
 )
 
-var scheme = runtime.NewScheme()
-var codecs = serializer.NewCodecFactory(scheme)
+var (
+	scheme = runtime.NewScheme()
+	codecs = serializer.NewCodecFactory(scheme)
+)
 
 func init() {
 	utilruntime.Must(admissionv1.AddToScheme(scheme))

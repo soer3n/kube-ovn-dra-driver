@@ -35,6 +35,12 @@ import (
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 )
 
+// The gRPC health services of the plugin, as the chart's probes name them.
+const (
+	healthServiceLiveness  = "liveness"
+	healthServiceReadiness = "readiness"
+)
+
 type healthcheck struct {
 	grpc_health_v1.UnimplementedHealthServer
 
@@ -43,6 +49,10 @@ type healthcheck struct {
 
 	regClient registerapi.RegistrationClient
 	draClient drapb.DRAPluginClient
+
+	// ready reports whether the plugin can serve claims, i.e. NRI is
+	// connected. It backs the "readiness" service; nil means ready.
+	ready func() bool
 }
 
 func startHealthcheck(ctx context.Context, config *Config) (*healthcheck, error) {
@@ -127,7 +137,7 @@ func (h *healthcheck) Stop(logger klog.Logger) {
 func (h *healthcheck) Check(ctx context.Context, req *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
 	log := klog.FromContext(ctx)
 
-	knownServices := map[string]struct{}{"": {}, "liveness": {}}
+	knownServices := map[string]struct{}{"": {}, healthServiceLiveness: {}, healthServiceReadiness: {}}
 	if _, known := knownServices[req.GetService()]; !known {
 		return nil, status.Error(codes.NotFound, "unknown service")
 	}
@@ -149,6 +159,11 @@ func (h *healthcheck) Check(ctx context.Context, req *grpc_health_v1.HealthCheck
 		return status, nil
 	}
 	log.V(5).Info("Successfully invoked NodePrepareResources")
+
+	if req.GetService() == healthServiceReadiness && h.ready != nil && !h.ready() {
+		log.V(2).Info("NRI plugin not connected, not ready")
+		return status, nil
+	}
 
 	status.Status = grpc_health_v1.HealthCheckResponse_SERVING
 	return status, nil

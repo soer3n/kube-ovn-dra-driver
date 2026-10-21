@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/urfave/cli/v2"
 
@@ -33,6 +34,7 @@ import (
 
 	"github.com/soer3n/kube-ovn-dra-driver/internal/profiles"
 	nicprofile "github.com/soer3n/kube-ovn-dra-driver/internal/profiles/nic"
+	"github.com/soer3n/kube-ovn-dra-driver/pkg/annotation"
 	"github.com/soer3n/kube-ovn-dra-driver/pkg/flags"
 	"github.com/soer3n/kube-ovn-dra-driver/pkg/plumbing"
 )
@@ -54,6 +56,8 @@ type Flags struct {
 	driverName                    string
 	podUID                        string
 	publishMode                   string
+	allocationTimeout             time.Duration
+	annotateVMIMAC                bool
 }
 
 type Config struct {
@@ -67,6 +71,10 @@ type Config struct {
 	// one plumbing.Spec per NIC, and the NRI hooks attach the pod's NICs.
 	// Shared so both DeviceState and the NRI plugin use the same instance.
 	nicStore *plumbing.NICStore
+
+	// annotateVMI merges annotations into a KubeVirt VMI; nil unless
+	// --annotate-vmi-mac is set.
+	annotateVMI vmiAnnotator
 }
 
 var validProfiles = map[string]func(flags Flags, clientSets flags.ClientSets) profiles.Profile{
@@ -106,7 +114,114 @@ func newApp() *cli.App {
 	flags := &Flags{
 		loggingConfig: flags.NewLoggingConfig(),
 	}
-	cliFlags := []cli.Flag{
+	cliFlags := pluginFlags(flags)
+	cliFlags = append(cliFlags, flags.kubeClientConfig.Flags()...)
+	cliFlags = append(cliFlags, flags.loggingConfig.Flags()...)
+
+	app := &cli.App{
+		Name:            "kube-ovn-dra-kubeletplugin",
+		Usage:           "kube-ovn-dra-kubeletplugin implements a DRA driver plugin for kube-ovn virtual NICs.",
+		ArgsUsage:       " ",
+		HideHelpCommand: true,
+		Flags:           cliFlags,
+		Before: func(c *cli.Context) error {
+			if c.Args().Len() > 0 {
+				return fmt.Errorf("arguments not supported: %v", c.Args().Slice())
+			}
+			if flags.publishMode != publishModeNode && flags.publishMode != publishModeCentral {
+				return fmt.Errorf("invalid publish mode %q, valid modes are %q and %q", flags.publishMode, publishModeNode, publishModeCentral)
+			}
+			if flags.allocationTimeout <= 0 {
+				return fmt.Errorf("allocation timeout must be positive, got %s", flags.allocationTimeout)
+			}
+			annotation.WaitTimeout = flags.allocationTimeout
+			return flags.loggingConfig.Apply()
+		},
+		Action: func(c *cli.Context) error {
+			ctx := c.Context
+			clientSets, err := flags.kubeClientConfig.NewClientSets()
+			if err != nil {
+				return fmt.Errorf("create client: %w", err)
+			}
+
+			if flags.driverName == "" {
+				flags.driverName = flags.profile + ".kubeovn.io"
+			}
+
+			newProfile, ok := validProfiles[flags.profile]
+			if !ok {
+				return fmt.Errorf("invalid device profile %q, valid profiles are %q", flags.profile, validProfileNames)
+			}
+
+			config := &Config{
+				flags:      flags,
+				coreclient: clientSets.Core,
+				profile:    newProfile(*flags, clientSets),
+				nicStore:   plumbing.NewNICStore(),
+			}
+			if flags.annotateVMIMAC {
+				config.annotateVMI = dynamicVMIAnnotator(clientSets.Dynamic)
+			}
+
+			return RunPlugin(ctx, config)
+		},
+	}
+
+	return app
+}
+
+func RunPlugin(ctx context.Context, config *Config) error {
+	logger := klog.FromContext(ctx)
+
+	err := os.MkdirAll(config.DriverPluginPath(), 0o750)
+	if err != nil {
+		return err
+	}
+
+	info, err := os.Stat(config.flags.cdiRoot)
+	switch {
+	case err != nil && os.IsNotExist(err):
+		err := os.MkdirAll(config.flags.cdiRoot, 0o750)
+		if err != nil {
+			return err
+		}
+	case err != nil:
+		return err
+	case !info.IsDir():
+		return fmt.Errorf("path for cdi file generation is not a directory: '%w'", err)
+	}
+
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	defer stop()
+	ctx, cancel := context.WithCancelCause(ctx)
+	config.cancelMainCtx = cancel
+
+	driver, err := NewDriver(ctx, config)
+	if err != nil {
+		return err
+	}
+
+	<-ctx.Done()
+	// restore default signal behavior as soon as possible in case graceful
+	// shutdown gets stuck.
+	stop()
+	if err := context.Cause(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		// A canceled context is the normal case here when the process receives
+		// a signal. Only log the error for more interesting cases.
+		logger.Error(err, "error from context")
+	}
+
+	err = driver.Shutdown(logger)
+	if err != nil {
+		logger.Error(err, "Unable to cleanly shutdown driver")
+	}
+
+	return nil
+}
+
+// pluginFlags returns the plugin's own command line flags, which fill in flags.
+func pluginFlags(flags *Flags) []cli.Flag {
+	return []cli.Flag{
 		&cli.StringFlag{
 			Name:        "node-name",
 			Usage:       "The name of the node to be worked on.",
@@ -164,6 +279,21 @@ func newApp() *cli.App {
 			Destination: &flags.publishMode,
 			EnvVars:     []string{"PUBLISH_MODE"},
 		},
+		&cli.DurationFlag{
+			Name: "allocation-timeout",
+			Usage: "How long preparing a claim waits for kube-ovn-controller to allocate a NIC. " +
+				"kubelet retries a prepare that timed out.",
+			Value:       annotation.WaitTimeout,
+			Destination: &flags.allocationTimeout,
+			EnvVars:     []string{"ALLOCATION_TIMEOUT"},
+		},
+		&cli.BoolFlag{
+			Name: "annotate-vmi-mac",
+			Usage: "Experimental: record the MAC of a KubeVirt VM's DRA NIC on its VMI as " + vmiMACAnnotationPrefix + "<interface>, " +
+				"so a KubeVirt Plugin CEL hook can add the NIC to the domain without a binding sidecar.",
+			Destination: &flags.annotateVMIMAC,
+			EnvVars:     []string{"ANNOTATE_VMI_MAC"},
+		},
 		&cli.StringFlag{
 			Name:        "pod-uid",
 			Usage:       "UID of the pod (used for seamless upgrades to create unique socket names).",
@@ -171,99 +301,4 @@ func newApp() *cli.App {
 			EnvVars:     []string{"POD_UID"},
 		},
 	}
-	cliFlags = append(cliFlags, flags.kubeClientConfig.Flags()...)
-	cliFlags = append(cliFlags, flags.loggingConfig.Flags()...)
-
-	app := &cli.App{
-		Name:            "kube-ovn-dra-kubeletplugin",
-		Usage:           "kube-ovn-dra-kubeletplugin implements a DRA driver plugin for kube-ovn virtual NICs.",
-		ArgsUsage:       " ",
-		HideHelpCommand: true,
-		Flags:           cliFlags,
-		Before: func(c *cli.Context) error {
-			if c.Args().Len() > 0 {
-				return fmt.Errorf("arguments not supported: %v", c.Args().Slice())
-			}
-			if flags.publishMode != publishModeNode && flags.publishMode != publishModeCentral {
-				return fmt.Errorf("invalid publish mode %q, valid modes are %q and %q", flags.publishMode, publishModeNode, publishModeCentral)
-			}
-			return flags.loggingConfig.Apply()
-		},
-		Action: func(c *cli.Context) error {
-			ctx := c.Context
-			clientSets, err := flags.kubeClientConfig.NewClientSets()
-			if err != nil {
-				return fmt.Errorf("create client: %w", err)
-			}
-
-			if flags.driverName == "" {
-				flags.driverName = flags.profile + ".kubeovn.io"
-			}
-
-			newProfile, ok := validProfiles[flags.profile]
-			if !ok {
-				return fmt.Errorf("invalid device profile %q, valid profiles are %q", flags.profile, validProfileNames)
-			}
-
-			config := &Config{
-				flags:      flags,
-				coreclient: clientSets.Core,
-				profile:    newProfile(*flags, clientSets),
-				nicStore:   plumbing.NewNICStore(),
-			}
-
-			return RunPlugin(ctx, config)
-		},
-	}
-
-	return app
-}
-
-func RunPlugin(ctx context.Context, config *Config) error {
-	logger := klog.FromContext(ctx)
-
-	err := os.MkdirAll(config.DriverPluginPath(), 0750)
-	if err != nil {
-		return err
-	}
-
-	info, err := os.Stat(config.flags.cdiRoot)
-	switch {
-	case err != nil && os.IsNotExist(err):
-		err := os.MkdirAll(config.flags.cdiRoot, 0750)
-		if err != nil {
-			return err
-		}
-	case err != nil:
-		return err
-	case !info.IsDir():
-		return fmt.Errorf("path for cdi file generation is not a directory: '%v'", err)
-	}
-
-	ctx, stop := signal.NotifyContext(ctx, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	defer stop()
-	ctx, cancel := context.WithCancelCause(ctx)
-	config.cancelMainCtx = cancel
-
-	driver, err := NewDriver(ctx, config)
-	if err != nil {
-		return err
-	}
-
-	<-ctx.Done()
-	// restore default signal behavior as soon as possible in case graceful
-	// shutdown gets stuck.
-	stop()
-	if err := context.Cause(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		// A canceled context is the normal case here when the process receives
-		// a signal. Only log the error for more interesting cases.
-		logger.Error(err, "error from context")
-	}
-
-	err = driver.Shutdown(logger)
-	if err != nil {
-		logger.Error(err, "Unable to cleanly shutdown driver")
-	}
-
-	return nil
 }

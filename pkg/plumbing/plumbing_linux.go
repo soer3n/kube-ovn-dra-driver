@@ -39,7 +39,7 @@ import (
 
 // createVethPair creates the veth pair on the host and brings the host side up.
 // Idempotent: if the host end already exists (retry), it is reused.
-func (a *ovsAttacher) createVethPair(ctx context.Context, host, pod string, mtu int) error {
+func (a *ovsAttacher) createVethPair(_ context.Context, host, pod string, mtu int) error {
 	if _, err := netlink.LinkByName(host); err == nil {
 		return nil // already created on a previous attempt
 	}
@@ -84,7 +84,7 @@ func (a *ovsAttacher) createVethPair(ctx context.Context, host, pod string, mtu 
 // live as "look up pod veth ...: Link not found" on a retried Attach whose
 // earlier attempt got past this step but failed in a later one (e.g.
 // attachToOVS or wireVMIBridge).
-func (a *ovsAttacher) moveIntoNetns(ctx context.Context, pod, netnsPath, ifaceName string) error {
+func (a *ovsAttacher) moveIntoNetns(_ context.Context, pod, netnsPath, ifaceName string) error {
 	ns, err := netns.GetFromPath(netnsPath)
 	if err != nil {
 		return fmt.Errorf("open netns %s: %w", netnsPath, err)
@@ -127,10 +127,37 @@ func (a *ovsAttacher) moveIntoNetns(ctx context.Context, pod, netnsPath, ifaceNa
 	return nil
 }
 
+// primaryIface is the pod's primary interface, set up by kube-ovn-cni.
+const primaryIface = "eth0"
+
+// primaryMTU returns the MTU of the pod's primary interface, which kube-ovn-cni
+// set from the subnet or the overlay's tunnel overhead, or 0 if there is none.
+func (a *ovsAttacher) primaryMTU(ctx context.Context, netnsPath string) int {
+	logger := klog.FromContext(ctx)
+	ns, err := netns.GetFromPath(netnsPath)
+	if err != nil {
+		logger.Error(err, "Open the pod netns to read the primary interface's MTU", "netns", netnsPath)
+		return 0
+	}
+	defer ns.Close()
+	h, err := netlink.NewHandleAt(ns)
+	if err != nil {
+		logger.Error(err, "Netlink handle to read the primary interface's MTU", "netns", netnsPath)
+		return 0
+	}
+	defer h.Close()
+	link, err := h.LinkByName(primaryIface)
+	if err != nil {
+		logger.V(2).Info("No primary interface to take the MTU from", "netns", netnsPath, "err", err)
+		return 0
+	}
+	return link.Attrs().MTU
+}
+
 // configurePodIface sets MAC, MTU, the IP/CIDR and per-NIC routes inside the
 // pod netns, then brings the interface up. It MUST NOT install a default route
 // — eth0 owns the default; this is a secondary NIC.
-func (a *ovsAttacher) configurePodIface(ctx context.Context, spec Spec) error {
+func (a *ovsAttacher) configurePodIface(_ context.Context, spec Spec) error {
 	ns, err := netns.GetFromPath(spec.NetnsPath)
 	if err != nil {
 		return fmt.Errorf("open netns %s: %w", spec.NetnsPath, err)
@@ -195,19 +222,13 @@ func (a *ovsAttacher) configurePodIface(ctx context.Context, spec Spec) error {
 
 	// Per-NIC routes only. Reject default routes defensively.
 	for _, r := range spec.Routes {
-		_, dst, err := net.ParseCIDR(r)
+		dst, gw, err := r.parse(spec.Gateway)
 		if err != nil {
-			return fmt.Errorf("parse route %q: %w", r, err)
+			return fmt.Errorf("NIC %s: %w", spec.IfaceName, err)
 		}
-		if ones, _ := dst.Mask.Size(); ones == 0 {
-			return fmt.Errorf("refusing to install default route %q on secondary NIC %s", r, spec.IfaceName)
-		}
-		route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst}
-		if spec.Gateway != "" {
-			route.Gw = net.ParseIP(spec.Gateway)
-		}
+		route := &netlink.Route{LinkIndex: link.Attrs().Index, Dst: dst, Gw: gw}
 		if err := h.RouteAdd(route); err != nil && !isExists(err) {
-			return fmt.Errorf("add route %s on %s: %w", r, spec.IfaceName, err)
+			return fmt.Errorf("add route %s on %s: %w", r.Destination, spec.IfaceName, err)
 		}
 	}
 	return nil
@@ -238,6 +259,7 @@ func (a *ovsAttacher) detachFromOVS(ctx context.Context, hostVeth string, _ Spec
 // DetachPodPorts removes the OVS ports this driver created for the pod, found
 // by the owner and pod external_ids, and deletes their host veths.
 func (a *ovsAttacher) DetachPodPorts(ctx context.Context, podName, podNamespace string) error {
+	// #nosec G204 -- a fixed binary; the arguments are matched as values by ovs-vsctl, not run by a shell.
 	out, err := exec.CommandContext(ctx, "ovs-vsctl", "--bare", "--columns=name", "find", "interface",
 		"external_ids:"+ownerExternalID+"="+ownerName,
 		"external_ids:pod_name="+podName,
@@ -261,7 +283,7 @@ func (a *ovsAttacher) DetachPodPorts(ctx context.Context, podName, podNamespace 
 
 // cleanupHostVeth deletes the host-side veth, which removes its pod-side peer.
 // Idempotent: a missing link is not an error.
-func (a *ovsAttacher) cleanupHostVeth(ctx context.Context, hostVeth string) error {
+func (a *ovsAttacher) cleanupHostVeth(_ context.Context, hostVeth string) error {
 	link, err := netlink.LinkByName(hostVeth)
 	if err != nil {
 		return nil // already gone
@@ -491,26 +513,36 @@ func (a *ovsAttacher) wireVMIBridge(ctx context.Context, spec Spec) error {
 // bridgeName, unless one is already running for it. See dhcp.go for why this
 // exists instead of relying on kube-ovn's own OVN-side DHCP responder.
 //
-// Idempotent via a.dhcpServers, keyed by spec.NetnsPath — NOT by bridgeName.
-// bridgeName is shortHashName(spec.IfaceName), which is deterministic from
-// the VMI's *network name* alone (the sidecar recomputes the exact same
-// hash every time from that name — that's the whole point of the naming
-// contract), so it is IDENTICAL across every separate pod instance that
-// ever attaches that same VMI network, e.g. every reboot/recreate of a
-// VMI. Confirmed live: recreating a VLAN-subnet VMI whose earlier
-// incarnation's DHCP server was still marked "running" in this map from
-// before found the map key already present, skipped starting a fresh
-// listener for the NEW pod's actual (different) netns/bridge, and left
-// nothing bound to :67 in it at all — the guest never got a lease.
-// spec.NetnsPath is a fresh, genuinely unique path per pod sandbox
-// instance, so keying on it means a stale/leaked entry from an
-// abnormally-torn-down previous pod (Detach not reliably called: a crash,
-// force-delete, or driver restart between Attach and Detach) can never
-// block a new pod's own server from starting, regardless of whether that
-// network name was ever used before.
+// Idempotent via a.dhcpServers, keyed by BOTH spec.NetnsPath and bridgeName.
+//
+// Neither part is enough alone. bridgeName is shortHashName(spec.IfaceName),
+// which is deterministic from the VMI's *network name* alone (the sidecar
+// recomputes the exact same hash every time from that name — that's the whole
+// point of the naming contract), so it is IDENTICAL across every separate pod
+// instance that ever attaches that same VMI network, e.g. every reboot/recreate
+// of a VMI. Confirmed live: recreating a VLAN-subnet VMI whose earlier
+// incarnation's DHCP server was still marked "running" in a bridge-keyed map
+// found the key already present, skipped starting a fresh listener for the NEW
+// pod's actual (different) netns/bridge, and left nothing bound to :67 in it
+// at all — the guest never got a lease. spec.NetnsPath is a fresh, genuinely
+// unique path per pod sandbox instance, so including it means a stale/leaked
+// entry from an abnormally-torn-down previous pod (Detach not reliably called:
+// a crash, force-delete, or driver restart between Attach and Detach) can never
+// block a new pod's own server from starting.
+//
+// The netns path alone is not enough either: a pod with several DRA NICs has ONE
+// netns and one bridge per NIC, so a netns-only key made the second NIC find the
+// first NIC's entry, return early, and never start a server for its own bridge —
+// the guest got a lease on the first NIC only. Confirmed live with a VM that had
+// two DRA NICs.
 func (a *ovsAttacher) ensureVMIDHCPServer(ctx context.Context, spec Spec, bridgeName string) error {
+	if spec.OVNDHCP {
+		klog.FromContext(ctx).V(2).Info("No DHCP server for a VMI NIC whose Subnet has OVN's DHCP", "iface", spec.IfaceName)
+		return nil
+	}
+	key := dhcpKey{netnsPath: spec.NetnsPath, bridge: bridgeName}
 	a.dhcpMu.Lock()
-	_, running := a.dhcpServers[spec.NetnsPath]
+	_, running := a.dhcpServers[key]
 	a.dhcpMu.Unlock()
 	if running {
 		return nil
@@ -547,7 +579,7 @@ func (a *ovsAttacher) ensureVMIDHCPServer(ctx context.Context, spec Spec, bridge
 	}
 
 	a.dhcpMu.Lock()
-	a.dhcpServers[spec.NetnsPath] = listener
+	a.dhcpServers[key] = listener
 	a.dhcpMu.Unlock()
 
 	logger := klog.FromContext(ctx)
@@ -561,13 +593,16 @@ func (a *ovsAttacher) ensureVMIDHCPServer(ctx context.Context, spec Spec, bridge
 	return nil
 }
 
-// stopVMIDHCPServer closes the listener started by ensureVMIDHCPServer, if
-// any, which makes its dhcp.Serve goroutine return. Idempotent: nothing
-// running is not an error. Keyed by netnsPath — see ensureVMIDHCPServer.
-func (a *ovsAttacher) stopVMIDHCPServer(netnsPath string) error {
+// stopVMIDHCPServer closes the listener ensureVMIDHCPServer started for one NIC
+// (its bridge in netnsPath), if any, which makes its dhcp.Serve goroutine
+// return. Only that NIC's server: the pod's other NICs keep theirs until their
+// own Detach. Idempotent: nothing running is not an error. Keyed like
+// ensureVMIDHCPServer — see there.
+func (a *ovsAttacher) stopVMIDHCPServer(netnsPath, bridge string) error {
+	key := dhcpKey{netnsPath: netnsPath, bridge: bridge}
 	a.dhcpMu.Lock()
-	listener, running := a.dhcpServers[netnsPath]
-	delete(a.dhcpServers, netnsPath)
+	listener, running := a.dhcpServers[key]
+	delete(a.dhcpServers, key)
 	a.dhcpMu.Unlock()
 	if !running {
 		return nil
@@ -695,6 +730,7 @@ func bridgeFdbReplaceStatic(ctx context.Context, ns netns.NsHandle, mac net.Hard
 		return fmt.Errorf("switch to target netns: %w", err)
 	}
 
+	// #nosec G204 -- a fixed binary; the MAC is parsed and the interface is ours, no shell is involved.
 	out, err := exec.CommandContext(ctx, "bridge", "fdb", "replace", mac.String(), "dev", ifaceName, "master", "static").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("bridge fdb replace: %w: %s", err, strings.TrimSpace(string(out)))
@@ -706,12 +742,12 @@ func bridgeFdbReplaceStatic(ctx context.Context, ns netns.NsHandle, mac net.Hard
 // underlying veth pair itself is left for Detach's existing cleanupHostVeth
 // (keyed by the host-side name, unaffected by the pod-side rename) to remove.
 // Idempotent: a missing netns or missing devices are not errors.
-func (a *ovsAttacher) unwireVMIBridge(ctx context.Context, spec Spec) error {
+func (a *ovsAttacher) unwireVMIBridge(_ context.Context, spec Spec) error {
 	bridgeName := bridgeNameFor(spec.IfaceName)
 	// Process-local state (see ovsAttacher.dhcpServers): stop it regardless of
 	// whether the netns below still resolves, or the goroutine leaks.
-	if err := a.stopVMIDHCPServer(spec.NetnsPath); err != nil {
-		return fmt.Errorf("stop DHCP server for netns %s: %w", spec.NetnsPath, err)
+	if err := a.stopVMIDHCPServer(spec.NetnsPath, bridgeName); err != nil {
+		return fmt.Errorf("stop DHCP server of %s in netns %s: %w", bridgeName, spec.NetnsPath, err)
 	}
 
 	ns, err := netns.GetFromPath(spec.NetnsPath)

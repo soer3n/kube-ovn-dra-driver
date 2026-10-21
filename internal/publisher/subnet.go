@@ -29,15 +29,19 @@
 package publisher
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"net/netip"
+	"regexp"
 	"strings"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 )
 
@@ -56,9 +60,20 @@ const (
 	DeviceNamePrefix = "subnet-"
 
 	// CapacityIPv4 and CapacityIPv6 are the consumable capacities of a device,
-	// one address of the family per NIC.
-	CapacityIPv4 resourceapi.QualifiedName = "nic.kubeovn.io/ipv4"
-	CapacityIPv6 resourceapi.QualifiedName = "nic.kubeovn.io/ipv6"
+	// one address of the family per NIC. Like the attributes they carry no
+	// domain, which DRA qualifies with the name of the publishing driver.
+	CapacityIPv4 resourceapi.QualifiedName = "ipv4"
+	CapacityIPv6 resourceapi.QualifiedName = "ipv6"
+
+	// The device attributes. Unqualified names belong to the domain of the
+	// driver that publishes them, so a CEL selector reads them as
+	// device.attributes['<driver name>'].subnetName whatever the driver name.
+	AttrSubnetName      resourceapi.QualifiedName = "subnetName"
+	AttrSubnetType      resourceapi.QualifiedName = "subnetType"
+	AttrVlanID          resourceapi.QualifiedName = "vlanId"
+	AttrProvider        resourceapi.QualifiedName = "provider"
+	AttrProviderNetwork resourceapi.QualifiedName = "providerNetwork"
+	AttrVPC             resourceapi.QualifiedName = "vpc"
 
 	// maxCount saturates address counts. An IPv6 Subnet has far more addresses
 	// than a capacity can express, and more than a scheduler could ever hand out.
@@ -103,17 +118,56 @@ func (s Subnet) Type() string {
 	return "ovn"
 }
 
-// DeviceName returns the name of the device of a Subnet.
+// DeviceName returns the name of the device of a Subnet: "subnet-<name>" if
+// that is a valid DNS label, as DRA requires for device names. A Subnet name is
+// a DNS subdomain, which can be longer and contain dots; such a name is
+// shortened and suffixed with a hash of the full name, which keeps the device
+// name stable and unique.
 func DeviceName(subnet string) string {
-	return DeviceNamePrefix + subnet
+	name := DeviceNamePrefix + subnet
+	if len(validation.IsDNS1123Label(name)) == 0 {
+		return name
+	}
+	sum := sha256.Sum256([]byte(subnet))
+	hash := hex.EncodeToString(sum[:])[:deviceNameHashLength]
+	base := strings.Trim(invalidLabelChars.ReplaceAllString(strings.ToLower(subnet), "-"), "-")
+	base = strings.TrimRight(base[:min(len(base), validation.DNS1123LabelMaxLength-len(DeviceNamePrefix)-len(hash)-1)], "-")
+	if base == "" {
+		return DeviceNamePrefix + hash
+	}
+	return DeviceNamePrefix + base + "-" + hash
 }
 
-// SubnetName returns the Subnet a device name belongs to.
-func SubnetName(device string) string {
-	if len(device) > len(DeviceNamePrefix) && strings.HasPrefix(device, DeviceNamePrefix) {
-		return device[len(DeviceNamePrefix):]
+// deviceNameHashLength is the length of the hash suffix of a shortened device
+// name; 12 hex digits make a collision between two Subnets practically
+// impossible.
+const deviceNameHashLength = 12
+
+var invalidLabelChars = regexp.MustCompile(`[^a-z0-9-]+`)
+
+// Publishable reports why a Subnet cannot back a DRA NIC, or nil if it can.
+// Only such Subnets are published, so a claim cannot select a device whose
+// claims would never be prepared.
+func (s Subnet) Publishable() error {
+	switch {
+	case s.Provider == "" || s.Provider == "ovn":
+		// The default provider names the pod's primary NIC.
+		return fmt.Errorf("subnet %q uses the default provider; a DRA NIC needs a dedicated provider such as %q", s.Name, s.Name+".<namespace>.ovn")
+	case !isOVNProvider(s.Provider):
+		// A non-OVN provider (e.g. macvlan IPAM only) gets no logical switch
+		// port, but the driver plugs every NIC into br-int and binds it to one.
+		return fmt.Errorf("subnet %q uses the non-OVN provider %q, which the DRA NIC driver does not support", s.Name, s.Provider)
+	case !s.V4.Enabled && !s.V6.Enabled:
+		return fmt.Errorf("subnet %q has no IPv4 or IPv6 CIDR; a DRA NIC needs an address", s.Name)
 	}
-	return device
+	return nil
+}
+
+// isOVNProvider mirrors kube-ovn's util.IsOvnProvider for a dedicated
+// provider: "<name>.<namespace>.ovn".
+func isOVNProvider(provider string) bool {
+	fields := strings.Split(provider, ".")
+	return len(fields) == 3 && fields[2] == "ovn"
 }
 
 // VlanInfo is what a Vlan object tells about a Subnet.
@@ -211,20 +265,20 @@ func statusCount(obj *unstructured.Unstructured, field string) int64 {
 // the free addresses per family as consumable capacity.
 func Device(s Subnet, withCapacity bool) resourceapi.Device {
 	attrs := map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-		"nic.kubeovn.io/subnetName": {StringValue: ptr.To(s.Name)},
-		"nic.kubeovn.io/subnetType": {StringValue: ptr.To(s.Type())},
+		AttrSubnetName: {StringValue: ptr.To(s.Name)},
+		AttrSubnetType: {StringValue: ptr.To(s.Type())},
 	}
 	if s.VlanID != 0 {
-		attrs["nic.kubeovn.io/vlanId"] = resourceapi.DeviceAttribute{IntValue: ptr.To(s.VlanID)}
+		attrs[AttrVlanID] = resourceapi.DeviceAttribute{IntValue: ptr.To(s.VlanID)}
 	}
 	if s.Provider != "" {
-		attrs["nic.kubeovn.io/provider"] = resourceapi.DeviceAttribute{StringValue: ptr.To(s.Provider)}
+		attrs[AttrProvider] = resourceapi.DeviceAttribute{StringValue: ptr.To(s.Provider)}
 	}
 	if s.ProviderNetwork != "" {
-		attrs["nic.kubeovn.io/providerNetwork"] = resourceapi.DeviceAttribute{StringValue: ptr.To(s.ProviderNetwork)}
+		attrs[AttrProviderNetwork] = resourceapi.DeviceAttribute{StringValue: ptr.To(s.ProviderNetwork)}
 	}
 	if s.VPC != "" {
-		attrs["nic.kubeovn.io/vpc"] = resourceapi.DeviceAttribute{StringValue: ptr.To(s.VPC)}
+		attrs[AttrVPC] = resourceapi.DeviceAttribute{StringValue: ptr.To(s.VPC)}
 	}
 
 	device := resourceapi.Device{
@@ -263,4 +317,15 @@ func capacities(s Subnet) map[resourceapi.QualifiedName]resourceapi.DeviceCapaci
 		}
 	}
 	return out
+}
+
+// StringAttribute reads a string attribute of a device published by driver,
+// unqualified or qualified with the driver name, which DRA treats as the same.
+func StringAttribute(device resourceapi.Device, driver string, name resourceapi.QualifiedName) string {
+	for _, key := range []resourceapi.QualifiedName{name, resourceapi.QualifiedName(driver + "/" + string(name))} {
+		if v, ok := device.Attributes[key]; ok && v.StringValue != nil {
+			return *v.StringValue
+		}
+	}
+	return ""
 }

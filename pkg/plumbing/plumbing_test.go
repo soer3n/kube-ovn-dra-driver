@@ -20,15 +20,50 @@ import (
 	"testing"
 )
 
+// Values shared by the tests of this package.
+const (
+	testPodIPv6WithMask = "fd00::5/120"
+	testHostVethPrefix  = "vh"
+	testPodIPWithMask   = "10.10.0.5/24"
+	testPodDualIPs      = "10.10.0.5,fd00::5"
+	testPodMAC          = "00:00:00:aa:bb:cc"
+	testContainerID16   = "0123456789abcdef"
+	testVMPort          = "vm1.default.blue.default.ovn"
+	testSandbox         = "abcdef0123456789"
+	testSandboxNet1     = "abcdef0123456789/net1"
+	testHashedIface     = "nicdda1950d"
+	testIface1          = "net1"
+	testIface2          = "net2"
+	testGateway         = "10.10.0.1"
+	testRouteGateway    = "10.10.0.254"
+	testRouteDst        = "10.0.0.0/8"
+	testPodRouteDst     = "192.168.0.0/16"
+	testOwnGwDst        = "10.20.0.0/16"
+	testDefaultRoute    = "0.0.0.0/0"
+	testIPv6RouteDst    = "fd00::/64"
+	testIPv6Gateway     = "fd01::1"
+	testClaimUID        = "claim"
+	testPodUID          = "uid-1"
+	testNetnsPath       = "/var/run/netns/x"
+	testNS              = "default"
+	testContainerID     = "cid"
+	testLauncherPod     = "virt-launcher-vm1"
+	testClaimA          = "claim-a"
+	testClaimB          = "claim-b"
+	testPodUID2         = "uid-2"
+	testIP              = "10.0.0.5/24"
+	testReplacedValue   = "again"
+)
+
 func TestSpecValidate(t *testing.T) {
 	base := func() Spec {
 		return Spec{
 			PodName:      "p",
 			PodNamespace: "ns",
 			NetnsPath:    "/proc/1/ns/net",
-			IfaceName:    "net1",
+			IfaceName:    testIface1,
 			IP:           "172.23.0.5/24",
-			ContainerID:  "abcdef0123456789",
+			ContainerID:  testSandbox,
 			IfaceID:      "p.ns.blue.ns.ovn",
 		}
 	}
@@ -57,12 +92,12 @@ func TestSpecValidate(t *testing.T) {
 
 func TestVethNames(t *testing.T) {
 	a := &ovsAttacher{}
-	host, pod, err := a.vethNames(Spec{ContainerID: "abcdef0123456789", IfaceName: "net1"})
+	host, pod, err := a.vethNames(Spec{ContainerID: testSandbox, IfaceName: testIface1})
 	if err != nil {
 		t.Fatalf("vethNames() unexpected error: %v", err)
 	}
-	wantHost := shortHashName("vh", "abcdef0123456789/net1")
-	wantPod := shortHashName("vc", "abcdef0123456789/net1")
+	wantHost := shortHashName(testHostVethPrefix, testSandboxNet1)
+	wantPod := shortHashName("vc", testSandboxNet1)
 	if host != wantHost {
 		t.Errorf("host = %q, want %q", host, wantHost)
 	}
@@ -78,7 +113,7 @@ func TestVethNames(t *testing.T) {
 	}
 	// Deterministic: same input must reproduce the same names (Attach's own
 	// idempotency and Detach both depend on this).
-	host2, pod2, err := a.vethNames(Spec{ContainerID: "abcdef0123456789", IfaceName: "net1"})
+	host2, pod2, err := a.vethNames(Spec{ContainerID: testSandbox, IfaceName: testIface1})
 	if err != nil || host2 != host || pod2 != pod {
 		t.Errorf("vethNames() not deterministic: got (%q, %q, %v), want (%q, %q, nil)", host2, pod2, err, host, pod)
 	}
@@ -99,7 +134,7 @@ func TestVethNames(t *testing.T) {
 // same-length-class iface name's names computed from a different key.
 func TestVethNamesLongIfaceName(t *testing.T) {
 	a := &ovsAttacher{}
-	host, pod, err := a.vethNames(Spec{ContainerID: "abcdef0123456789", IfaceName: "poddda1950dc07"})
+	host, pod, err := a.vethNames(Spec{ContainerID: testSandbox, IfaceName: "poddda1950dc07"})
 	if err != nil {
 		t.Fatalf("vethNames() with a 14-char IfaceName: unexpected error: %v", err)
 	}
@@ -110,11 +145,11 @@ func TestVethNamesLongIfaceName(t *testing.T) {
 	// Different container IDs sharing a leading hex digit must NOT collide
 	// (the actual bug: the old scheme derived names from only 1 truncated
 	// character of the containerID here, since 12-len("nicdda1950d")=1).
-	hostA, podA, err := a.vethNames(Spec{ContainerID: "cabc000000000000", IfaceName: "nicdda1950d"})
+	hostA, podA, err := a.vethNames(Spec{ContainerID: "cabc000000000000", IfaceName: testHashedIface})
 	if err != nil {
 		t.Fatalf("vethNames() unexpected error: %v", err)
 	}
-	hostB, podB, err := a.vethNames(Spec{ContainerID: "cdef000000000000", IfaceName: "nicdda1950d"})
+	hostB, podB, err := a.vethNames(Spec{ContainerID: "cdef000000000000", IfaceName: testHashedIface})
 	if err != nil {
 		t.Fatalf("vethNames() unexpected error: %v", err)
 	}
@@ -125,63 +160,100 @@ func TestVethNamesLongIfaceName(t *testing.T) {
 
 func TestVethNamesEmptyContainerID(t *testing.T) {
 	a := &ovsAttacher{}
-	if _, _, err := a.vethNames(Spec{ContainerID: "", IfaceName: "net1"}); err == nil {
+	if _, _, err := a.vethNames(Spec{ContainerID: "", IfaceName: testIface1}); err == nil {
 		t.Fatal("vethNames() with empty ContainerID: want error, got nil")
 	}
 }
 
 func TestNICStore(t *testing.T) {
 	s := NewNICStore()
-	s.Add(Spec{PodUID: "uid-1", ClaimUID: "claim-a", IfaceName: "net1"})
-	s.Add(Spec{PodUID: "uid-1", ClaimUID: "claim-b", IfaceName: "net2"})
-	s.Add(Spec{PodUID: "uid-2", ClaimUID: "claim-c", IfaceName: "net1"})
-	s.Add(Spec{PodUID: "uid-1", ClaimUID: "claim-a", IfaceName: "net1", IP: "10.0.0.5/24"})
+	s.Add(Spec{PodUID: testPodUID, ClaimUID: testClaimA, IfaceName: testIface1})
+	s.Add(Spec{PodUID: testPodUID, ClaimUID: testClaimB, IfaceName: testIface2})
+	s.Add(Spec{PodUID: testPodUID2, ClaimUID: "claim-c", IfaceName: testIface1})
+	s.Add(Spec{PodUID: testPodUID, ClaimUID: testClaimA, IfaceName: testIface1, IP: testIP})
 
-	specs := s.Specs("uid-1")
-	if len(specs) != 2 || specs[0].IP != "10.0.0.5/24" || specs[1].IfaceName != "net2" {
+	specs := s.Specs(testPodUID)
+	if len(specs) != 2 || specs[0].IP != testIP || specs[1].IfaceName != testIface2 {
 		t.Fatalf("Specs(uid-1) = %+v, want net1 (replaced) and net2", specs)
 	}
 	specs[0].NetnsPath = "/changed"
-	if s.Specs("uid-1")[0].NetnsPath != "" {
+	if s.Specs(testPodUID)[0].NetnsPath != "" {
 		t.Error("Specs must return a copy")
 	}
-	if got := s.Specs("uid-1"); len(got) != 2 {
+	if got := s.Specs(testPodUID); len(got) != 2 {
 		t.Errorf("Specs must not drain the store, got %d", len(got))
 	}
 
-	s.RemoveClaim("claim-a")
-	if got := s.Specs("uid-1"); len(got) != 1 || got[0].ClaimUID != "claim-b" {
+	s.RemoveClaim(testClaimA)
+	if got := s.Specs(testPodUID); len(got) != 1 || got[0].ClaimUID != testClaimB {
 		t.Errorf("after RemoveClaim(claim-a) Specs(uid-1) = %+v, want claim-b only", got)
 	}
-	s.RemoveClaim("claim-b")
-	if got := s.Specs("uid-1"); got != nil {
+	s.RemoveClaim(testClaimB)
+	if got := s.Specs(testPodUID); got != nil {
 		t.Errorf("after removing all claims Specs(uid-1) = %+v, want nil", got)
 	}
-	if got := s.Specs("uid-2"); len(got) != 1 {
+	if got := s.Specs(testPodUID2); len(got) != 1 {
 		t.Errorf("Specs(uid-2) len = %d, want 1", len(got))
 	}
 
-	s.MarkAttached("uid-1", Spec{IfaceName: "net1"})
-	s.MarkAttached("uid-1", Spec{IfaceName: "net1", ContainerID: "again"})
-	s.MarkAttached("uid-1", Spec{IfaceName: "net2"})
-	if got := s.TakeAttached("uid-1"); len(got) != 2 || got[0].ContainerID != "again" {
+	s.MarkAttached(testPodUID, Spec{IfaceName: testIface1})
+	s.MarkAttached(testPodUID, Spec{IfaceName: testIface1, ContainerID: testReplacedValue})
+	s.MarkAttached(testPodUID, Spec{IfaceName: testIface2})
+	if got := s.TakeAttached(testPodUID); len(got) != 2 || got[0].ContainerID != testReplacedValue {
 		t.Errorf("TakeAttached(uid-1) = %+v, want net1 (replaced) and net2", got)
 	}
-	if got := s.TakeAttached("uid-1"); len(got) != 0 {
+	if got := s.TakeAttached(testPodUID); len(got) != 0 {
 		t.Errorf("TakeAttached(uid-1) after drain len = %d, want 0", len(got))
 	}
 }
 
 func TestDeviceNames(t *testing.T) {
-	for _, name := range []string{bridgeNameFor("net1"), vethRenameFor("net1"), shortHashName("vh", "a/very/long/key/that/exceeds/ifnamsiz")} {
+	for _, name := range []string{bridgeNameFor(testIface1), vethRenameFor(testIface1), shortHashName(testHostVethPrefix, "a/very/long/key/that/exceeds/ifnamsiz")} {
 		if len(name) > 15 {
 			t.Errorf("%q exceeds IFNAMSIZ", name)
 		}
 	}
-	if bridgeNameFor("net1") == bridgeNameFor("net2") || bridgeNameFor("net1") == vethRenameFor("net1") {
+	if bridgeNameFor(testIface1) == bridgeNameFor(testIface2) || bridgeNameFor(testIface1) == vethRenameFor(testIface1) {
 		t.Error("bridge and veth rename names must be distinct per interface")
 	}
-	if name := bridgeNameFor("net1"); name != shortHashName("kvb", "net1") {
+	if name := bridgeNameFor(testIface1); name != shortHashName("kvb", testIface1) {
 		t.Errorf("bridgeNameFor(net1) = %q, want the deterministic hash name", name)
+	}
+}
+
+func TestRouteParse(t *testing.T) {
+	tests := []struct {
+		name           string
+		route          Route
+		defaultGateway string
+		wantGateway    string
+		wantErr        bool
+	}{
+		{"default gateway", Route{Destination: testRouteDst}, testGateway, testGateway, false},
+		{"own gateway", Route{Destination: testRouteDst, Gateway: testRouteGateway}, testGateway, testRouteGateway, false},
+		{"on-link without gateway", Route{Destination: testRouteDst}, "", "", false},
+		{"ipv6 route on-link next to an ipv4 gateway", Route{Destination: testIPv6RouteDst}, testGateway, "", false},
+		{"ipv6 route via its gateway", Route{Destination: testIPv6RouteDst, Gateway: testIPv6Gateway}, testGateway, testIPv6Gateway, false},
+		{"gateway of another family", Route{Destination: testRouteDst, Gateway: testIPv6Gateway}, "", "", true},
+		{"default route", Route{Destination: testDefaultRoute}, testGateway, "", true},
+		{"invalid gateway", Route{Destination: testRouteDst, Gateway: "x"}, "", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, gw, err := tt.route.parse(tt.defaultGateway)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parse() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			got := ""
+			if gw != nil {
+				got = gw.String()
+			}
+			if got != tt.wantGateway {
+				t.Errorf("parse() gateway = %q, want %q", got, tt.wantGateway)
+			}
+		})
 	}
 }

@@ -84,7 +84,7 @@ type ConfigHandler interface {
 type NoopConfigHandler struct{}
 
 // ApplyConfig implements [ConfigHandler].
-func (n NoopConfigHandler) ApplyConfig(config runtime.Object, results []*resourceapi.DeviceRequestAllocationResult) (PerDeviceCDIContainerEdits, error) {
+func (n NoopConfigHandler) ApplyConfig(config runtime.Object, _ []*resourceapi.DeviceRequestAllocationResult) (PerDeviceCDIContainerEdits, error) {
 	if config != nil {
 		return nil, errors.New("configuration not allowed")
 	}
@@ -97,6 +97,6 @@ func (n NoopConfigHandler) SchemeBuilder() runtime.SchemeBuilder {
 }
 
 // Validate implements [ConfigHandler].
-func (n NoopConfigHandler) Validate(config runtime.Object) error {
+func (n NoopConfigHandler) Validate(_ runtime.Object) error {
 	return errors.New("configuration not allowed")
 }

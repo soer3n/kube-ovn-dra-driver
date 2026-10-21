@@ -60,10 +60,14 @@ func (a *ovsAttacher) ensureVMIDHCPServer(ctx context.Context, spec Spec, bridge
 	return ErrNotImplemented
 }
 
-func (a *ovsAttacher) stopVMIDHCPServer(bridgeName string) error {
+func (a *ovsAttacher) stopVMIDHCPServer(netnsPath, bridge string) error {
 	return ErrNotImplemented
 }
 
 func (a *ovsAttacher) DetachPodPorts(ctx context.Context, podName, podNamespace string) error {
 	return ErrNotImplemented
+}
+
+func (a *ovsAttacher) primaryMTU(ctx context.Context, netnsPath string) int {
+	return 0
 }

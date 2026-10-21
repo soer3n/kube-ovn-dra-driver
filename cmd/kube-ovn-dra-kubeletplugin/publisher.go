@@ -338,6 +338,10 @@ func (s *snapshotter) resources() (resourceslice.DriverResources, error) {
 			logger.Error(err, "Skipping a Subnet", "subnet", u.GetName())
 			continue
 		}
+		if err := subnet.Publishable(); err != nil {
+			logger.V(4).Info("Not publishing subnet", "reason", err)
+			continue
+		}
 		subnets = append(subnets, subnet)
 	}
 	sort.Slice(subnets, func(i, j int) bool { return subnets[i].Name < subnets[j].Name })

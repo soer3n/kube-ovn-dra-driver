@@ -18,16 +18,22 @@ package v1alpha1
 
 import "testing"
 
+// Values shared by the tests of this package.
+const (
+	testIfaceNet1 = "net1"
+	testIfaceEth9 = "eth9"
+)
+
 func TestNicConfigNormalize(t *testing.T) {
 	c := &NicConfig{}
-	if err := c.Normalize(); err != nil || c.InterfaceName != "net1" {
+	if err := c.Normalize(); err != nil || c.InterfaceName != testIfaceNet1 {
 		t.Errorf("Normalize() = %v, InterfaceName %q; want net1", err, c.InterfaceName)
 	}
-	c = &NicConfig{InterfaceName: "eth9"}
-	if err := c.Normalize(); err != nil || c.InterfaceName != "eth9" {
+	c = &NicConfig{InterfaceName: testIfaceEth9}
+	if err := c.Normalize(); err != nil || c.InterfaceName != testIfaceEth9 {
 		t.Errorf("Normalize() changed an explicit InterfaceName to %q", c.InterfaceName)
 	}
-	if d := DefaultNicConfig(); d.InterfaceName != "net1" || d.Kind != NicConfigKind {
+	if d := DefaultNicConfig(); d.InterfaceName != testIfaceNet1 || d.Kind != NicConfigKind {
 		t.Errorf("DefaultNicConfig() = %+v", d)
 	}
 }
@@ -39,7 +45,7 @@ func TestNicConfigValidate(t *testing.T) {
 		wantErr bool
 	}{
 		{"empty defaults", "", false},
-		{"net1", "net1", false},
+		{"net1", testIfaceNet1, false},
 		{"15 characters", "abcdefghijklmno", false},
 		{"16 characters", "abcdefghijklmnop", true},
 		{"dot", ".", true},

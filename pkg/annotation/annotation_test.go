@@ -26,6 +26,16 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 )
 
+// Values shared by the tests of this package.
+const (
+	testIP      = "10.10.0.5"
+	testMAC     = "00:00:00:aa:bb:cc"
+	testCIDR    = "10.10.0.0/24"
+	testGateway = "10.10.0.1"
+	testSubnet  = "blue"
+	testVM      = "vm1"
+)
+
 const (
 	testProvider = "blue.default.ovn"
 	testPod      = "pod1"
@@ -35,17 +45,17 @@ const (
 func allocatedAnnotations(key string) map[string]string {
 	return map[string]string{
 		key + ".kubernetes.io/allocated":      "true",
-		key + ".kubernetes.io/ip_address":     "10.10.0.5",
-		key + ".kubernetes.io/mac_address":    "00:00:00:aa:bb:cc",
-		key + ".kubernetes.io/cidr":           "10.10.0.0/24",
-		key + ".kubernetes.io/gateway":        "10.10.0.1",
-		key + ".kubernetes.io/logical_switch": "blue",
+		key + ".kubernetes.io/ip_address":     testIP,
+		key + ".kubernetes.io/mac_address":    testMAC,
+		key + ".kubernetes.io/cidr":           testCIDR,
+		key + ".kubernetes.io/gateway":        testGateway,
+		key + ".kubernetes.io/logical_switch": testSubnet,
 	}
 }
 
 func TestExtractAllocation(t *testing.T) {
 	withVM := allocatedAnnotations(testProvider)
-	withVM[testProvider+".kubernetes.io/virtualmachine"] = "vm1"
+	withVM[testProvider+".kubernetes.io/virtualmachine"] = testVM
 	notAllocated := allocatedAnnotations(testProvider)
 	notAllocated[testProvider+".kubernetes.io/allocated"] = "false"
 	noMAC := allocatedAnnotations(testProvider)
@@ -62,11 +72,11 @@ func TestExtractAllocation(t *testing.T) {
 		{"allocated without mac", noMAC, nil},
 		{
 			"allocated", allocatedAnnotations(testProvider),
-			&AllocatedNIC{IP: "10.10.0.5", MAC: "00:00:00:aa:bb:cc", CIDR: "10.10.0.0/24", Gateway: "10.10.0.1", SubnetName: "blue", Provider: testProvider},
+			&AllocatedNIC{IP: testIP, MAC: testMAC, CIDR: testCIDR, Gateway: testGateway, SubnetName: testSubnet, Provider: testProvider},
 		},
 		{
 			"port named after a vm", withVM,
-			&AllocatedNIC{IP: "10.10.0.5", MAC: "00:00:00:aa:bb:cc", CIDR: "10.10.0.0/24", Gateway: "10.10.0.1", SubnetName: "blue", VMName: "vm1", Provider: testProvider},
+			&AllocatedNIC{IP: testIP, MAC: testMAC, CIDR: testCIDR, Gateway: testGateway, SubnetName: testSubnet, VMName: testVM, Provider: testProvider},
 		},
 	}
 	for _, tt := range tests {
@@ -112,7 +122,7 @@ func TestWaitForAllocation(t *testing.T) {
 		if _, err := WaitForAllocation(context.Background(), fake.NewSimpleClientset(), testNS, testPod, testProvider); err == nil {
 			t.Fatal("expected an error for a missing pod")
 		}
-		if time.Since(start) > waitTimeout/2 {
+		if time.Since(start) > WaitTimeout/2 {
 			t.Error("a missing pod should fail fast instead of waiting for the timeout")
 		}
 	})

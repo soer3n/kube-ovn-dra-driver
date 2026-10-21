@@ -23,20 +23,25 @@ package nic
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
+	"k8s.io/klog/v2"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 	cdispec "tags.cncf.io/container-device-interface/specs-go"
 
@@ -62,10 +67,15 @@ var vlanGVR = schema.GroupVersionResource{
 	Resource: "vlans",
 }
 
+var nodeGVR = schema.GroupVersionResource{Version: "v1", Resource: "nodes"}
+
 // Profile implements profiles.Profile for kube-ovn virtual NICs.
 type Profile struct {
 	nodeName      string
 	dynamicClient dynamic.Interface
+	// subnets maps the enumerated device names to their Subnet names. A device
+	// name does not always contain the Subnet name (see publisher.DeviceName).
+	subnets *sync.Map
 }
 
 // NewProfile creates a NIC profile. dynamicClient is used to list kube-ovn
@@ -74,6 +84,7 @@ func NewProfile(nodeName string, dynamicClient dynamic.Interface) Profile {
 	return Profile{
 		nodeName:      nodeName,
 		dynamicClient: dynamicClient,
+		subnets:       &sync.Map{},
 	}
 }
 
@@ -100,6 +111,17 @@ func (p Profile) EnumerateDevices() (resourceslice.DriverResources, error) {
 		return publisher.ParseVlan(vlan), nil
 	}
 
+	// A VLAN underlay Subnet only works on the nodes where its ProviderNetwork
+	// is ready, which have the provider bridge and the uplink. The central
+	// publisher scopes its pool with a node selector; here the node simply
+	// does not publish it.
+	node, err := p.dynamicClient.Resource(nodeGVR).Get(ctx, p.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return resourceslice.DriverResources{}, fmt.Errorf("get node %s: %w", p.nodeName, err)
+	}
+	nodeLabels := node.GetLabels()
+
+	logger := klog.FromContext(ctx)
 	var devices []resourceapi.Device
 	for i := range subnets.Items {
 		subnet := &subnets.Items[i]
@@ -110,7 +132,18 @@ func (p Profile) EnumerateDevices() (resourceslice.DriverResources, error) {
 		if err != nil {
 			return resourceslice.DriverResources{}, err
 		}
-		devices = append(devices, publisher.Device(s, false))
+		if err := s.Publishable(); err != nil {
+			logger.V(4).Info("Not publishing subnet", "subnet", s.Name, "reason", err)
+			continue
+		}
+		if s.ProviderNetwork != "" && nodeLabels[publisher.ReadyLabel(s.ProviderNetwork)] != "true" {
+			logger.V(4).Info("Not publishing subnet, its provider network is not ready on this node",
+				"subnet", s.Name, "providerNetwork", s.ProviderNetwork, "node", p.nodeName)
+			continue
+		}
+		device := publisher.Device(s, false)
+		p.subnets.Store(device.Name, s.Name)
+		devices = append(devices, device)
 	}
 
 	resources := resourceslice.DriverResources{
@@ -148,7 +181,25 @@ func (p Profile) WatchDevices(ctx context.Context, onChange func()) error {
 		}
 		synced = append(synced, informer.HasSynced)
 	}
+	// The node's labels say on which ProviderNetworks it is ready.
+	nodeFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(p.dynamicClient, 0, "", func(opts *metav1.ListOptions) {
+		opts.FieldSelector = fields.OneTermEqualSelector("metadata.name", p.nodeName).String()
+	})
+	nodeInformer := nodeFactory.ForResource(nodeGVR).Informer()
+	if _, err := nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(oldObj, newObj any) {
+			oldU, ok1 := oldObj.(*unstructured.Unstructured)
+			newU, ok2 := newObj.(*unstructured.Unstructured)
+			if !ok1 || !ok2 || !equality.Semantic.DeepEqual(oldU.GetLabels(), newU.GetLabels()) {
+				onChange()
+			}
+		},
+	}); err != nil {
+		return fmt.Errorf("watch node %s: %w", p.nodeName, err)
+	}
+	synced = append(synced, nodeInformer.HasSynced)
 	factory.Start(ctx.Done())
+	nodeFactory.Start(ctx.Done())
 	if !cache.WaitForCacheSync(ctx.Done(), synced...) {
 		return fmt.Errorf("sync kube-ovn subnet and vlan informers: %w", ctx.Err())
 	}
@@ -164,6 +215,66 @@ func specEqual(oldObj, newObj any) bool {
 	}
 	return equality.Semantic.DeepEqual(oldU.Object["spec"], newU.Object["spec"])
 }
+
+// SubnetOVNDHCP reports whether the Subnet has OVN's DHCP enabled
+// (spec.enableDHCP), so the guest of a VM takes its addresses from OVN.
+func (p Profile) SubnetOVNDHCP(ctx context.Context, subnetName string) (bool, error) {
+	subnet, err := p.dynamicClient.Resource(subnetGVR).Get(ctx, subnetName, metav1.GetOptions{})
+	if err != nil {
+		return false, fmt.Errorf("get subnet %s: %w", subnetName, err)
+	}
+	enabled, _, _ := unstructured.NestedBool(subnet.Object, "spec", "enableDHCP")
+	return enabled, nil
+}
+
+// SubnetMTU returns the MTU of a NIC on the Subnet, the way kube-ovn-cni picks
+// it for a pod: the Subnet's spec.mtu, else for a VLAN underlay Subnet without
+// a logical gateway or U2O interconnection the MTU of its ProviderNetwork on
+// this node. It returns 0 for an overlay Subnet: the NIC then takes the MTU of
+// the pod's primary interface, which kube-ovn-cni set for the overlay.
+func (p Profile) SubnetMTU(ctx context.Context, subnetName string) (int, error) {
+	subnet, err := p.dynamicClient.Resource(subnetGVR).Get(ctx, subnetName, metav1.GetOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("get subnet %s: %w", subnetName, err)
+	}
+	if mtu, _, _ := unstructured.NestedInt64(subnet.Object, "spec", "mtu"); mtu > 0 {
+		return int(mtu), nil
+	}
+	if mtu, _, _ := unstructured.NestedFloat64(subnet.Object, "spec", "mtu"); mtu > 0 {
+		return int(mtu), nil
+	}
+	vlanName, _, _ := unstructured.NestedString(subnet.Object, "spec", "vlan")
+	logicalGateway, _, _ := unstructured.NestedBool(subnet.Object, "spec", "logicalGateway")
+	u2o, _, _ := unstructured.NestedBool(subnet.Object, "spec", "u2oInterconnection")
+	if vlanName == "" || logicalGateway || u2o {
+		return 0, nil
+	}
+	vlan, err := p.dynamicClient.Resource(vlanGVR).Get(ctx, vlanName, metav1.GetOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("get vlan %s of subnet %s: %w", vlanName, subnetName, err)
+	}
+	providerNetwork := publisher.ParseVlan(vlan).Provider
+	if providerNetwork == "" {
+		return 0, nil
+	}
+	node, err := p.dynamicClient.Resource(nodeGVR).Get(ctx, p.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("get node %s: %w", p.nodeName, err)
+	}
+	value := node.GetLabels()[fmt.Sprintf(providerNetworkMTULabel, providerNetwork)]
+	if value == "" {
+		return 0, nil
+	}
+	mtu, err := strconv.Atoi(value)
+	if err != nil || mtu <= 0 {
+		return 0, fmt.Errorf("invalid MTU %q of provider network %s on node %s", value, providerNetwork, p.nodeName)
+	}
+	return mtu, nil
+}
+
+// providerNetworkMTULabel is the node label in which kube-ovn records the MTU
+// of a ProviderNetwork's uplink on the node.
+const providerNetworkMTULabel = "%s.provider-network.kubernetes.io/mtu"
 
 // SchemeBuilder implements profiles.ConfigHandler.
 func (p Profile) SchemeBuilder() runtime.SchemeBuilder {
@@ -190,7 +301,7 @@ func (p Profile) ApplyConfig(config runtime.Object, results []*resourceapi.Devic
 	}
 	nicConfig, ok := config.(*configapi.NicConfig)
 	if !ok {
-		return nil, fmt.Errorf("runtime object is not a recognized NicConfig")
+		return nil, errors.New("runtime object is not a recognized NicConfig")
 	}
 	if err := nicConfig.Normalize(); err != nil {
 		return nil, fmt.Errorf("normalizing NicConfig: %w", err)
@@ -200,7 +311,7 @@ func (p Profile) ApplyConfig(config runtime.Object, results []*resourceapi.Devic
 	for _, result := range results {
 		key := envKey(nicConfig.InterfaceName)
 		envs := []string{
-			fmt.Sprintf("KUBE_OVN_NIC_%s_SUBNET=%s", key, subnetNameFromDevice(result.Device)),
+			fmt.Sprintf("KUBE_OVN_NIC_%s_SUBNET=%s", key, p.subnetNameFromDevice(result.Device)),
 			fmt.Sprintf("KUBE_OVN_NIC_%s_DEVICE=%s", key, result.Device),
 		}
 		edits := &cdispec.ContainerEdits{Env: envs}
@@ -216,8 +327,14 @@ func envKey(ifaceName string) string {
 	return nonEnvChars.ReplaceAllString(strings.ToUpper(ifaceName), "_")
 }
 
-// subnetNameFromDevice strips the "subnet-" prefix from the device name to
-// recover the original kube-ovn Subnet name.
-func subnetNameFromDevice(deviceName string) string {
-	return publisher.SubnetName(deviceName)
+// subnetNameFromDevice returns the kube-ovn Subnet of an enumerated device.
+func (p Profile) subnetNameFromDevice(deviceName string) string {
+	if p.subnets != nil {
+		if name, ok := p.subnets.Load(deviceName); ok {
+			if subnet, ok := name.(string); ok {
+				return subnet
+			}
+		}
+	}
+	return strings.TrimPrefix(deviceName, publisher.DeviceNamePrefix)
 }

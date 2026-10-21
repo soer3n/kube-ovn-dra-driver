@@ -26,7 +26,7 @@ import (
 
 func TestVMIDHCPOptions(t *testing.T) {
 	mask := net.CIDRMask(24, 32)
-	opts, err := vmiDHCPOptions(Spec{Gateway: "10.10.0.1", MTU: 1400, Routes: []string{"192.168.0.0/16"}}, mask)
+	opts, err := vmiDHCPOptions(Spec{Gateway: testGateway, MTU: 1400, Routes: []Route{{Destination: testPodRouteDst}}}, mask)
 	if err != nil {
 		t.Fatalf("vmiDHCPOptions() error = %v", err)
 	}
@@ -53,19 +53,22 @@ func TestVMIDHCPOptions(t *testing.T) {
 }
 
 func TestClasslessStaticRoutes(t *testing.T) {
+	route := func(dst, gw string) []Route { return []Route{{Destination: dst, Gateway: gw}} }
 	tests := []struct {
 		name    string
-		routes  []string
+		routes  []Route
 		gateway string
 		want    []byte
 		wantErr bool
 	}{
-		{"none", nil, "10.10.0.1", nil, false},
-		{"/8 via gateway", []string{"10.0.0.0/8"}, "10.10.0.1", []byte{8, 10, 10, 10, 0, 1}, false},
-		{"/32 without gateway", []string{"1.2.3.4/32"}, "", []byte{32, 1, 2, 3, 4, 0, 0, 0, 0}, false},
-		{"ipv6 skipped", []string{"fd00::/64"}, "10.10.0.1", nil, false},
-		{"default route refused", []string{"0.0.0.0/0"}, "10.10.0.1", nil, true},
-		{"invalid route", []string{"bogus"}, "10.10.0.1", nil, true},
+		{"none", nil, testGateway, nil, false},
+		{"/8 via gateway", route(testRouteDst, ""), testGateway, []byte{8, 10, 10, 10, 0, 1}, false},
+		{"/8 via its own gateway", route(testRouteDst, testRouteGateway), testGateway, []byte{8, 10, 10, 10, 0, 254}, false},
+		{"/32 without gateway", route("1.2.3.4/32", ""), "", []byte{32, 1, 2, 3, 4, 0, 0, 0, 0}, false},
+		{"ipv6 skipped", route(testIPv6RouteDst, ""), testGateway, nil, false},
+		{"gateway of another family", route(testRouteDst, "fd00::1"), testGateway, nil, true},
+		{"default route refused", route(testDefaultRoute, ""), testGateway, nil, true},
+		{"invalid route", route("bogus", ""), testGateway, nil, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

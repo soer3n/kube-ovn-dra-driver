@@ -39,7 +39,7 @@ type CDIHandler struct {
 	class      string
 }
 
-func NewCDIHandler(root string, driverName, class string) (*CDIHandler, error) {
+func NewCDIHandler(root, driverName, class string) (*CDIHandler, error) {
 	cache, err := cdiapi.NewCache(
 		cdiapi.WithSpecDirs(root),
 	)
@@ -73,7 +73,7 @@ func (cdi *CDIHandler) CreateCommonSpecFile() error {
 
 	minVersion, err := cdiapi.MinimumRequiredVersion(spec)
 	if err != nil {
-		return fmt.Errorf("failed to get minimum required CDI spec version: %v", err)
+		return fmt.Errorf("failed to get minimum required CDI spec version: %w", err)
 	}
 	spec.Version = minVersion
 
@@ -122,7 +122,7 @@ func (cdi *CDIHandler) CreateClaimSpecFile(claimUID string, devices profiles.Pre
 
 	minVersion, err := cdiapi.MinimumRequiredVersion(spec)
 	if err != nil {
-		return fmt.Errorf("failed to get minimum required CDI spec version: %v", err)
+		return fmt.Errorf("failed to get minimum required CDI spec version: %w", err)
 	}
 	spec.Version = minVersion
 

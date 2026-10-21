@@ -97,16 +97,15 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 	go refreshDevicesLoop(ctx, trigger, refreshDelay, state.RefreshDevices, publish)
 
 	// Start the NRI plugin that attaches the NICs when a pod sandbox is
-	// created. Without it, claims are still prepared but pods start without
-	// their DRA NICs, so the failure is logged loudly instead of stopping the
-	// driver.
-	logger := klog.FromContext(ctx)
+	// created. Claims are only prepared while it is connected (see
+	// prepareResourceClaim), so a pod never starts without its DRA NICs.
 	handler := plumbing.NewSandboxHandler(config.nicStore, plumbing.NewOVSAttacher())
-	nri, err := startNRIPlugin(ctx, handler)
+	driver.nri, err = startNRIPlugin(ctx, handler)
 	if err != nil {
-		logger.Error(err, "NRI plugin unavailable; DRA NICs will not be attached to pods")
-	} else {
-		driver.nri = nri
+		return nil, fmt.Errorf("start NRI plugin: %w", err)
+	}
+	if driver.healthcheck != nil {
+		driver.healthcheck.ready = driver.nri.Ready
 	}
 
 	return driver, nil
@@ -138,6 +137,13 @@ func (d *driver) PrepareResourceClaims(ctx context.Context, claims []*resourceap
 func (d *driver) prepareResourceClaim(ctx context.Context, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
 	logger := klog.FromContext(ctx)
 	logger.Info("Preparing claim", "uid", claim.UID, "namespace", claim.Namespace, "name", claim.Name)
+	if d.nri != nil && !d.nri.Ready() {
+		// Without NRI nobody attaches the NICs when the sandbox starts. Failing
+		// makes kubelet retry the prepare once the plugin is connected.
+		err := errors.New("NRI plugin is not connected to the container runtime, DRA NICs cannot be attached yet")
+		logger.Error(err, "Refusing to prepare claim", "uid", claim.UID)
+		return kubeletplugin.PrepareResult{Err: err}
+	}
 	preparedPBs, err := d.state.Prepare(ctx, claim)
 	if err != nil {
 		logger.Error(err, "Error preparing devices for claim", "uid", claim.UID)

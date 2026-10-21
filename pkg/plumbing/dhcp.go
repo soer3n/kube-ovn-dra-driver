@@ -18,8 +18,10 @@ package plumbing
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"time"
 
@@ -85,8 +87,8 @@ func vmiDHCPOptions(spec Spec, mask net.IPMask) (dhcp.Options, error) {
 		opts[dhcp.OptionRouter] = gw.To4()
 	}
 
-	if spec.MTU > 0 {
-		opts[dhcp.OptionInterfaceMTU] = []byte{byte(spec.MTU >> 8), byte(spec.MTU)} //nolint:mnd
+	if spec.MTU > 0 && spec.MTU <= math.MaxUint16 {
+		opts[dhcp.OptionInterfaceMTU] = binary.BigEndian.AppendUint16(nil, uint16(spec.MTU))
 	}
 
 	routes, err := classlessStaticRoutes(spec.Routes, spec.Gateway)
@@ -100,39 +102,26 @@ func vmiDHCPOptions(spec Spec, mask net.IPMask) (dhcp.Options, error) {
 	return opts, nil
 }
 
-// classlessStaticRoutes encodes spec.Routes as DHCP option 121 (RFC 3442):
-// each entry is a destination network reachable via gateway, matching
-// configurePodIface's own per-NIC route semantics for the plain-pod case.
-// Refuses a default route for the same reason configurePodIface does: the
-// default route belongs to eth0, never to this secondary NIC.
-func classlessStaticRoutes(routes []string, gateway string) ([]byte, error) {
-	if len(routes) == 0 {
-		return nil, nil
-	}
-	var gw net.IP
-	if gateway != "" {
-		gw = net.ParseIP(gateway).To4()
-	}
-
+// classlessStaticRoutes encodes the IPv4 routes of spec.Routes as DHCP option
+// 121 (RFC 3442), with the same gateway rules as configurePodIface. IPv6
+// routes are skipped: this DHCP server is IPv4 only.
+func classlessStaticRoutes(routes []Route, gateway string) ([]byte, error) {
 	var out []byte
 	for _, r := range routes {
-		_, dst, err := net.ParseCIDR(r)
+		dst, gw, err := r.parse(gateway)
 		if err != nil {
-			return nil, fmt.Errorf("plumbing: parse route %q for DHCP options: %w", r, err)
+			return nil, fmt.Errorf("plumbing: route for DHCP options: %w", err)
 		}
-		width, _ := dst.Mask.Size()
-		if width == 0 {
-			return nil, fmt.Errorf("plumbing: refusing to serve a default route %q via DHCP on a secondary NIC", r)
-		}
-		octets := (width-1)/8 + 1 //nolint:mnd
 		ip4 := dst.IP.To4()
 		if ip4 == nil {
-			continue // IPv6 routes are out of scope for this IPv4-only DHCP server
+			continue
 		}
-		out = append(out, byte(width))
+		width, _ := dst.Mask.Size()
+		octets := (width-1)/8 + 1      //nolint:mnd
+		out = append(out, byte(width)) // #nosec G115 -- an IPv4 prefix length, at most 32
 		out = append(out, ip4[:octets]...)
-		if gw != nil {
-			out = append(out, gw...)
+		if gw4 := gw.To4(); gw4 != nil {
+			out = append(out, gw4...)
 		} else {
 			out = append(out, 0, 0, 0, 0) //nolint:mnd
 		}

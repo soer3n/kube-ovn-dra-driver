@@ -29,20 +29,31 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// Values shared by the tests of this package.
+const (
+	testResourceGroup = "resource.k8s.io"
+	testV1Claim       = "test-v1-claim"
+	testV1beta1Claim  = "test-v1beta1-claim"
+	testV1beta2Claim  = "test-v1beta2-claim"
+	testNS            = "default"
+	testDeviceRequest = "test-device"
+	testDeviceClass   = "test-class"
+)
+
 func TestExtractResourceClaim(t *testing.T) {
 	// Create test objects for each version
 	v1Claim := &resourcev1.ResourceClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-v1-claim",
-			Namespace: "default",
+			Name:      testV1Claim,
+			Namespace: testNS,
 		},
 		Spec: resourcev1.ResourceClaimSpec{
 			Devices: resourcev1.DeviceClaim{
 				Requests: []resourcev1.DeviceRequest{
 					{
-						Name: "test-device",
+						Name: testDeviceRequest,
 						Exactly: &resourcev1.ExactDeviceRequest{
-							DeviceClassName: "test-class",
+							DeviceClassName: testDeviceClass,
 						},
 					},
 				},
@@ -52,15 +63,15 @@ func TestExtractResourceClaim(t *testing.T) {
 
 	v1beta1Claim := &resourcev1beta1.ResourceClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-v1beta1-claim",
-			Namespace: "default",
+			Name:      testV1beta1Claim,
+			Namespace: testNS,
 		},
 		Spec: resourcev1beta1.ResourceClaimSpec{
 			Devices: resourcev1beta1.DeviceClaim{
 				Requests: []resourcev1beta1.DeviceRequest{
 					{
-						Name:            "test-device",
-						DeviceClassName: "test-class",
+						Name:            testDeviceRequest,
+						DeviceClassName: testDeviceClass,
 					},
 				},
 			},
@@ -69,16 +80,16 @@ func TestExtractResourceClaim(t *testing.T) {
 
 	v1beta2Claim := &resourcev1beta2.ResourceClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-v1beta2-claim",
-			Namespace: "default",
+			Name:      testV1beta2Claim,
+			Namespace: testNS,
 		},
 		Spec: resourcev1beta2.ResourceClaimSpec{
 			Devices: resourcev1beta2.DeviceClaim{
 				Requests: []resourcev1beta2.DeviceRequest{
 					{
-						Name: "test-device",
+						Name: testDeviceRequest,
 						Exactly: &resourcev1beta2.ExactDeviceRequest{
-							DeviceClassName: "test-class",
+							DeviceClassName: testDeviceClass,
 						},
 					},
 				},
@@ -97,26 +108,26 @@ func TestExtractResourceClaim(t *testing.T) {
 			name:         "v1 ResourceClaim",
 			resource:     resourceClaimResourceV1,
 			obj:          v1Claim,
-			expectedName: "test-v1-claim",
+			expectedName: testV1Claim,
 			expectError:  false,
 		},
 		{
 			name:         "v1beta1 ResourceClaim",
 			resource:     resourceClaimResourceV1Beta1,
 			obj:          v1beta1Claim,
-			expectedName: "test-v1beta1-claim",
+			expectedName: testV1beta1Claim,
 			expectError:  false,
 		},
 		{
 			name:         "v1beta2 ResourceClaim",
 			resource:     resourceClaimResourceV1Beta2,
 			obj:          v1beta2Claim,
-			expectedName: "test-v1beta2-claim",
+			expectedName: testV1beta2Claim,
 			expectError:  false,
 		},
 		{
 			name:         "Unsupported version",
-			resource:     metav1.GroupVersionResource{Group: "resource.k8s.io", Version: "v2", Resource: "resourceclaims"},
+			resource:     metav1.GroupVersionResource{Group: testResourceGroup, Version: "v2", Resource: "resourceclaims"},
 			obj:          v1Claim,
 			expectedName: "",
 			expectError:  true,
@@ -149,9 +160,9 @@ func TestExtractResourceClaim(t *testing.T) {
 				assert.NoError(t, err)
 				assert.NotNil(t, result)
 				assert.Equal(t, tt.expectedName, result.Name)
-				assert.Equal(t, "default", result.Namespace)
-				assert.Equal(t, "test-device", result.Spec.Devices.Requests[0].Name)
-				assert.Equal(t, "test-class", result.Spec.Devices.Requests[0].Exactly.DeviceClassName)
+				assert.Equal(t, testNS, result.Namespace)
+				assert.Equal(t, testDeviceRequest, result.Spec.Devices.Requests[0].Name)
+				assert.Equal(t, testDeviceClass, result.Spec.Devices.Requests[0].Exactly.DeviceClassName)
 			}
 		})
 	}

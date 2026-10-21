@@ -28,20 +28,50 @@ package nicprepare
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	coreclientset "k8s.io/client-go/kubernetes"
 
+	"github.com/soer3n/kube-ovn-dra-driver/internal/publisher"
 	"github.com/soer3n/kube-ovn-dra-driver/pkg/annotation"
+	"github.com/soer3n/kube-ovn-dra-driver/pkg/plumbing"
 )
 
 // defaultProvider is the provider of the pod's primary kube-ovn NIC.
 const defaultProvider = "ovn"
+
+// providersAnnotation is where kube-ovn-controller records on a claim the subnet
+// and provider it allocated each NIC with, as JSON keyed by "<pool>/<device>".
+// A recorded NIC keeps them even if the subnet's provider changed since.
+const providersAnnotation = "ovn.kubernetes.io/dra_providers"
+
+// nicRecord is one entry of providersAnnotation.
+type nicRecord struct {
+	Subnet   string `json:"subnet"`
+	Provider string `json:"provider"`
+}
+
+// recordedNIC returns the subnet and provider kube-ovn-controller recorded for
+// the allocated device, if it did.
+func recordedNIC(claim *resourceapi.ResourceClaim, result *resourceapi.DeviceRequestAllocationResult) (nicRecord, bool, error) {
+	value := claim.Annotations[providersAnnotation]
+	if value == "" {
+		return nicRecord{}, false, nil
+	}
+	records := map[string]nicRecord{}
+	if err := json.Unmarshal([]byte(value), &records); err != nil {
+		return nicRecord{}, false, fmt.Errorf("invalid %s annotation of claim %s/%s: %w", providersAnnotation, claim.Namespace, claim.Name, err)
+	}
+	record, ok := records[result.Pool+"/"+result.Device]
+	return record, ok, nil
+}
 
 // NicDeviceConfig holds everything the driver needs to plug one NIC. It is
 // created during PrepareResourceClaims.
@@ -76,10 +106,24 @@ type NicDeviceConfig struct {
 	MAC     string
 	CIDR    string
 	Gateway string
+	// VMName is the KubeVirt VM (and VMI) of a virt-launcher pod, empty for
+	// other pods. kube-ovn names the NIC's port after it.
+	VMName string
+
+	// Routes are the NIC's extra routes from kube-ovn's routes annotation.
+	Routes []plumbing.Route
+	// MTU is the NIC's MTU, 0 to take the one of the pod's primary interface.
+	// The caller sets it (see DeviceState.subnetMTU).
+	MTU int
+	// OVNDHCP reports whether the Subnet has OVN's DHCP enabled, so a VM's
+	// guest takes its addresses from OVN. The caller sets it (see
+	// DeviceState.subnetOVNDHCP).
+	OVNDHCP bool
 }
 
 // RequestIPAM waits for kube-ovn-controller to allocate the NIC from the claim
-// and reads the result from the pod's per-provider annotations.
+// and reads the result from the pod's per-provider annotations. nodeName is the
+// node the claim is prepared on; it picks the pod of a shared claim.
 func RequestIPAM(
 	ctx context.Context,
 	client coreclientset.Interface,
@@ -87,19 +131,26 @@ func RequestIPAM(
 	result *resourceapi.DeviceRequestAllocationResult,
 	device resourceapi.Device,
 	ifaceName string,
+	nodeName string,
 ) (*NicDeviceConfig, error) {
-	podName, podNS, podUID, err := lookupPodForClaim(ctx, client, claim)
+	podName, podNS, podUID, err := lookupPodForClaim(ctx, client, claim, nodeName)
 	if err != nil {
 		return nil, fmt.Errorf("find pod for claim %s/%s: %w", claim.Namespace, claim.Name, err)
 	}
 
-	subnetName := extractSubnetName(device)
+	// The controller keys the result annotations by the subnet's provider: the
+	// one it recorded on the claim, or for a new NIC the subnet's spec.provider,
+	// which the published provider attribute carries.
+	subnetName := extractSubnetName(device, result.Driver)
+	provider := extractProvider(device, result.Driver)
+	if record, ok, err := recordedNIC(claim, result); err != nil {
+		return nil, err
+	} else if ok {
+		subnetName, provider = record.Subnet, record.Provider
+	}
 	if subnetName == "" {
 		return nil, fmt.Errorf("device %s has no subnetName attribute", device.Name)
 	}
-	// The controller keys the result annotations by the subnet's provider, so
-	// the published provider attribute must match the subnet's spec.provider.
-	provider := extractProvider(device)
 	if err := validateSecondaryProvider(provider, subnetName); err != nil {
 		return nil, err
 	}
@@ -113,6 +164,13 @@ func RequestIPAM(
 			"(no %s.kubernetes.io/allocated or %s.%s.kubernetes.io/allocated annotation); check the pod's events "+
 			"and that kube-ovn-controller runs with --enable-dra-nic and --dra-nic-driver-name=%s: %w",
 			ifaceName, subnetName, podNS, podName, provider, provider, ifaceName, result.Driver, err)
+	}
+
+	var routes []plumbing.Route
+	if alloc.Routes != "" {
+		if err := json.Unmarshal([]byte(alloc.Routes), &routes); err != nil {
+			return nil, fmt.Errorf("invalid %s.kubernetes.io/routes annotation of pod %s/%s: %w", alloc.Provider, podNS, podName, err)
+		}
 	}
 
 	portOwner := podName
@@ -135,6 +193,8 @@ func RequestIPAM(
 		MAC:               alloc.MAC,
 		CIDR:              cidr,
 		Gateway:           gateway,
+		Routes:            routes,
+		VMName:            alloc.VMName,
 	}, nil
 }
 
@@ -198,43 +258,76 @@ func withMask(ip, cidr string) string {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-// lookupPodForClaim resolves the pod name/namespace from claim.Status.ReservedFor.
+// kubevirtVMLabel is the label KubeVirt sets on every virt-launcher pod of a VMI.
+const kubevirtVMLabel = "vm.kubevirt.io/name"
+
+// lookupPodForClaim returns the pod on nodeName that the claim is reserved for.
 // kubelet always populates ReservedFor before calling PrepareResourceClaims.
-func lookupPodForClaim(ctx context.Context, client coreclientset.Interface, claim *resourceapi.ResourceClaim) (podName, podNS, podUID string, err error) {
+//
+// A claim stands for one NIC with one address, so it can only be shared by the
+// virt-launcher pods of one KubeVirt VM: the source and the target pod of a
+// live migration, which kube-ovn gives the VM's address (keep-vm-ip). Each node
+// prepares the claim for its own pod. kubelet prepares a claim only once per
+// node, so a second consumer on the same node would get no NIC; it is rejected.
+func lookupPodForClaim(ctx context.Context, client coreclientset.Interface, claim *resourceapi.ResourceClaim, nodeName string) (podName, podNS, podUID string, err error) {
 	podNS = claim.Namespace
+	var consumers, onNode []*corev1.Pod
+	refs := 0
 	for _, ref := range claim.Status.ReservedFor {
 		if ref.Resource != "pods" || ref.APIGroup != "" {
 			continue
 		}
-		uid := types.UID(ref.UID)
-		pods, listErr := client.CoreV1().Pods(podNS).List(ctx, metav1.ListOptions{
-			FieldSelector: fmt.Sprintf("metadata.uid=%s", uid),
-		})
-		if listErr != nil || len(pods.Items) == 0 {
-			pods, listErr = client.CoreV1().Pods(podNS).List(ctx, metav1.ListOptions{})
-			if listErr != nil {
-				return "", "", "", fmt.Errorf("list pods in namespace %s: %w", podNS, listErr)
-			}
+		refs++
+		pod, getErr := client.CoreV1().Pods(podNS).Get(ctx, ref.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(getErr) || (getErr == nil && pod.UID != ref.UID) {
+			// A consumer that is already gone, e.g. a migration's source pod.
+			continue
 		}
-		for _, pod := range pods.Items {
-			if pod.UID == uid {
-				return pod.Name, podNS, string(uid), nil
-			}
+		if getErr != nil {
+			return "", "", "", fmt.Errorf("get pod %s/%s: %w", podNS, ref.Name, getErr)
 		}
-		return "", "", "", fmt.Errorf("pod with UID %s not found in namespace %s", uid, podNS)
+		consumers = append(consumers, pod)
+		if pod.Spec.NodeName == nodeName {
+			onNode = append(onNode, pod)
+		}
 	}
-	return "", "", "", fmt.Errorf("claim %s/%s has no pod in ReservedFor", claim.Namespace, claim.Name)
+	if refs == 0 {
+		return "", "", "", fmt.Errorf("claim %s/%s has no pod in ReservedFor", claim.Namespace, claim.Name)
+	}
+	if err := checkSharedClaim(claim, consumers); err != nil {
+		return "", "", "", err
+	}
+	switch len(onNode) {
+	case 0:
+		return "", "", "", fmt.Errorf("claim %s/%s has no pod on node %s in ReservedFor", claim.Namespace, claim.Name, nodeName)
+	case 1:
+		return onNode[0].Name, podNS, string(onNode[0].UID), nil
+	default:
+		return "", "", "", fmt.Errorf("claim %s/%s is reserved for more than one pod on node %s (%s, %s); "+
+			"a DRA NIC is prepared once per node, use one claim per pod", claim.Namespace, claim.Name, nodeName, onNode[0].Name, onNode[1].Name)
+	}
+}
+
+// checkSharedClaim rejects a claim shared by pods that are not the
+// virt-launcher pods of one KubeVirt VM.
+func checkSharedClaim(claim *resourceapi.ResourceClaim, consumers []*corev1.Pod) error {
+	if len(consumers) < 2 {
+		return nil
+	}
+	vm := consumers[0].Labels[kubevirtVMLabel]
+	for _, pod := range consumers {
+		if vm == "" || pod.Labels[kubevirtVMLabel] != vm {
+			return fmt.Errorf("claim %s/%s is shared by pods %s and %s; a DRA NIC claim can only be shared by "+
+				"the virt-launcher pods of one KubeVirt VM (live migration), use one claim per pod",
+				claim.Namespace, claim.Name, consumers[0].Name, pod.Name)
+		}
+	}
+	return nil
 }
 
 // extractSubnetName reads the subnetName device attribute.
-func extractSubnetName(device resourceapi.Device) string {
-	if device.Attributes == nil {
-		return ""
-	}
-	if v := device.Attributes["nic.kubeovn.io/subnetName"]; v.StringValue != nil {
-		return *v.StringValue
-	}
-	return ""
+func extractSubnetName(device resourceapi.Device, driver string) string {
+	return publisher.StringAttribute(device, driver, publisher.AttrSubnetName)
 }
 
 // validateSecondaryProvider rejects subnets that cannot back a secondary NIC.
@@ -255,12 +348,6 @@ func validateSecondaryProvider(provider, subnetName string) error {
 
 // extractProvider reads the provider device attribute (the kube-ovn Subnet's
 // spec.provider). Empty when the subnet has no explicit provider.
-func extractProvider(device resourceapi.Device) string {
-	if device.Attributes == nil {
-		return ""
-	}
-	if v := device.Attributes["nic.kubeovn.io/provider"]; v.StringValue != nil {
-		return *v.StringValue
-	}
-	return ""
+func extractProvider(device resourceapi.Device, driver string) string {
+	return publisher.StringAttribute(device, driver, publisher.AttrProvider)
 }
