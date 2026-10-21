@@ -19,7 +19,21 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
+if [ "${E2E_RWX:-0}" = "1" ]; then
+  # NFS clients hang when their server goes first, and the kind nodes with them:
+  # remove the VMs and their volumes on NFS (not the server's own volume), then
+  # the NFS server
+  kubectl delete vm --all -A --wait=true --timeout=5m || true
+  kubectl get pvc -A -o jsonpath='{range .items[?(@.spec.storageClassName=="nfs4")]}{.metadata.namespace} {.metadata.name}{"\n"}{end}{range .items[?(@.spec.storageClassName=="nfs")]}{.metadata.namespace} {.metadata.name}{"\n"}{end}' |
+    while read -r ns name; do
+      kubectl delete pvc -n "$ns" "$name" --wait=true --timeout=5m || true
+    done || true
+  make kind-delete-nfs || true
+fi
 if [ "${E2E_CONTAINERLAB:-0}" = "1" ]; then
+  if [ "${E2E_KUBEVIRT:-0}" = "1" ]; then
+    export CONTAINERLAB_TOPOLOGY="$ROOT/demo/containerlab/vlan-topology-2workers.yaml"
+  fi
   make clab-destroy || true
 fi
 make kind-delete

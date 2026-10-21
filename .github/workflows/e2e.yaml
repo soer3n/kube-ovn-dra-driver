@@ -1,27 +1,83 @@
 name: Run e2e tests
 
-# Manual only: the e2e suite stands up a full kind + kube-ovn (DRA fork image) +
-# driver stack, which is heavy and depends on the published
-# docker.io/soer3n/kube-ovn:dra-driver-<version> image. Trigger from the Actions
-# tab when you want to validate end-to-end. The VLAN-underlay (containerlab)
-# specs are not run here (they need sudo + containerlab); run those locally with
-# E2E_CONTAINERLAB=1.
+# The e2e suite stands up kind, kube-ovn with --enable-dra-nic and the driver,
+# and runs test/e2e. kube-ovn's DRA NIC support is not in a release yet, so the
+# kube-ovn image is built here from the branch of the upstream pull request
+# (soer3n/kube-ovn dra-nic-upstream), under the name the Makefile deploys by
+# default; the chart comes from the same checkout (KUBE_OVN_REPO=../kube-ovn).
+# The underlay variant also deploys the containerlab VLAN fabric (a Linux bridge
+# and an FRR gateway on the runner) and runs the VLAN-underlay specs
+# (E2E_CONTAINERLAB=1). The kubevirt variant runs the live migration specs on two
+# workers with KubeVirt, which adds the DRA NIC to the domain with a KubeVirt
+# Plugin (deployments/kubevirt) (E2E_KUBEVIRT=1); kubevirt-rwx, only on request,
+# also migrates a VM with a DataVolume on NFS (E2E_RWX=1). The KubeVirt variants run
+# the latest release, v1.9.0; kubevirt-1.10 runs the kubevirt variant on
+# v1.10.0-beta.0, whose Plugin API calls the hook list launcherHooks (make
+# kind-deploy-kubevirt converts deployments/kubevirt/plugin.yaml). The dual variant runs
+# the suite in a dual-stack cluster with the dual-stack and IPv6-only specs
+# (E2E_IP_FAMILY=dual). node and node-dual run the underlay variant with the
+# driver in node publish mode (E2E_PUBLISH_MODE=node), in an IPv4 and in a
+# dual-stack cluster.
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
+    inputs:
+      kube-ovn-ref:
+        description: kube-ovn ref (of soer3n/kube-ovn) to build and deploy
+        default: dra-nic-upstream
+      rwx:
+        description: also run the kubevirt-rwx variant (CDI, NFS, DataVolume migration)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+env:
+  KUBE_OVN_REF: ${{ inputs.kube-ovn-ref || 'dra-nic-upstream' }}
+
 jobs:
   e2e:
+    name: e2e (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(inputs.rwx && '["overlay","underlay","kubevirt","kubevirt-1.10","dual","node","node-dual","kubevirt-rwx"]' || '["overlay","underlay","kubevirt","kubevirt-1.10","dual","node","node-dual"]') }}
+    env:
+      E2E_CONTAINERLAB: ${{ (matrix.variant == 'underlay' || startsWith(matrix.variant, 'node')) && '1' || '0' }}
+      E2E_KUBEVIRT: ${{ startsWith(matrix.variant, 'kubevirt') && '1' || '0' }}
+      E2E_RWX: ${{ matrix.variant == 'kubevirt-rwx' && '1' || '0' }}
+      E2E_IP_FAMILY: ${{ endsWith(matrix.variant, 'dual') && 'dual' || 'ipv4' }}
+      E2E_PUBLISH_MODE: ${{ startsWith(matrix.variant, 'node') && 'node' || 'central' }}
+      # set for every variant: an empty value would override the Makefile default
+      KUBEVIRT_VERSION: ${{ matrix.variant == 'kubevirt-1.10' && 'v1.10.0-beta.0' || 'v1.9.0' }}
+    defaults:
+      run:
+        working-directory: kube-ovn-dra-driver
     steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        path: kube-ovn-dra-driver
+    - name: Checkout kube-ovn
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        repository: soer3n/kube-ovn
+        ref: ${{ env.KUBE_OVN_REF }}
+        path: kube-ovn
+    - name: Enable KVM
+      if: env.E2E_KUBEVIRT == '1'
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
     - name: Install Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: 1.25.5
-    - name: Checkout code
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: install helm and kubectl
       run: |
         sudo snap install helm --classic
@@ -29,10 +85,24 @@ jobs:
     - name: install kind
       # The release that ships the Makefile's kindest/node v1.36 image.
       run: go install sigs.k8s.io/kind@v0.33.0
+    - name: install containerlab
+      if: env.E2E_CONTAINERLAB == '1'
+      run: bash -c "$(curl -sL https://get.containerlab.dev)" -- -v 0.71.0
+    - name: Build the kube-ovn image
+      working-directory: kube-ovn
+      env:
+        # kube-ovn's go.mod asks for a newer toolchain than the driver's
+        GOTOOLCHAIN: auto
+      run: |
+        make build-go
+        docker build -t "$(make -s -C ../kube-ovn-dra-driver print-KUBE_OVN_IMAGE KUBE_OVN_VERSION="$KUBE_OVN_REF")" \
+          --build-arg VERSION="$(cat VERSION)" -f dist/images/Dockerfile dist/images/
     - name: Setup e2e
-      run: make setup-e2e
+      run: make setup-e2e KUBE_OVN_VERSION="$KUBE_OVN_REF"
     - name: Run e2e tests
       run: make test-e2e
     - name: Teardown e2e
       if: always()
+      # also destroys the containerlab fabric when E2E_CONTAINERLAB=1 and NFS
+      # when E2E_RWX=1
       run: make teardown-e2e

@@ -34,15 +34,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/soer3n/kube-ovn-dra-driver/internal/publisher"
 )
 
 // The central publish mode (`make kind-deploy-driver PUBLISH_MODE=central`, the
-// default of the Makefile) publishes one pool per Subnet instead of one pool per
+// default of the chart and the Makefile) publishes one pool per Subnet instead of one pool per
 // node. These specs skip when the driver runs in node mode.
 
 const (
-	deviceNamePrefix = "subnet-"
-	capacityIPv4     = resourcev1.QualifiedName("nic.kubeovn.io/ipv4")
+	capacityIPv4 = resourcev1.QualifiedName("ipv4")
 
 	// capacitySubnet is a small overlay subnet the capacity spec creates, so the
 	// pool can be exhausted with a handful of pods.
@@ -53,11 +54,13 @@ const (
 	netshootImage       = "nicolaka/netshoot@sha256:47b907d662d139d1e2f22bfe14f4efca1e3f1feed283572f47c970c780c03b61"
 )
 
-var providerNetworkGVR = schema.GroupVersionResource{Group: "kubeovn.io", Version: "v1", Resource: "provider-networks"}
-var vlanGVR = schema.GroupVersionResource{Group: "kubeovn.io", Version: "v1", Resource: "vlans"}
+var (
+	providerNetworkGVR = schema.GroupVersionResource{Group: publisher.SubnetGVR.Group, Version: publisher.SubnetGVR.Version, Resource: "provider-networks"}
+	vlanGVR            = publisher.VlanGVR
+)
 
 func kubectlStdin(stdin string, args ...string) (string, error) {
-	cmd := exec.Command("kubectl", args...)
+	cmd := exec.Command(kubectlBinary, args...)
 	cmd.Dir = repoRoot()
 	cmd.Stdin = strings.NewReader(stdin)
 	out, err := cmd.CombinedOutput()
@@ -66,7 +69,7 @@ func kubectlStdin(stdin string, args ...string) (string, error) {
 
 // publisherRunning reports whether the driver runs in central publish mode.
 func publisherRunning(ctx context.Context) bool {
-	deployments, err := clientset.AppsV1().Deployments("kube-system").List(ctx, metav1.ListOptions{
+	deployments, err := clientset.AppsV1().Deployments(kubeSystemNS).List(ctx, metav1.ListOptions{
 		LabelSelector: "app.kubernetes.io/component=publisher",
 	})
 	Expect(err).NotTo(HaveOccurred())
@@ -86,17 +89,28 @@ func driverSlices(ctx context.Context) map[string][]resourcev1.ResourceSlice {
 	return byPool
 }
 
-func subnetNames(ctx context.Context) []string {
+// subnetNames returns the Subnets the driver publishes and the ones it leaves
+// out (the default provider, a non-OVN provider or no CIDR, e.g. join).
+func subnetNames(ctx context.Context) (published, unpublished []string) {
 	list, err := dynClient.Resource(subnetGVR).List(ctx, metav1.ListOptions{})
 	Expect(err).NotTo(HaveOccurred())
-	var names []string
-	for _, item := range list.Items {
-		if _, found, _ := unstructured.NestedMap(item.Object, "spec"); found {
-			names = append(names, item.GetName())
+	noVlan := func(string) (publisher.VlanInfo, error) { return publisher.VlanInfo{}, nil }
+	for i := range list.Items {
+		item := &list.Items[i]
+		if _, found, _ := unstructured.NestedMap(item.Object, fieldSpec); !found {
+			continue
+		}
+		subnet, err := publisher.ParseSubnet(item, noVlan)
+		Expect(err).NotTo(HaveOccurred())
+		if subnet.Publishable() == nil {
+			published = append(published, item.GetName())
+		} else {
+			unpublished = append(unpublished, item.GetName())
 		}
 	}
-	sort.Strings(names)
-	return names
+	sort.Strings(published)
+	sort.Strings(unpublished)
+	return published, unpublished
 }
 
 // subnetFree returns the free IPv4 addresses a Subnet reports in its status.
@@ -105,7 +119,7 @@ func subnetFree(ctx context.Context, subnet string) (int64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	value, found, _ := unstructured.NestedFieldNoCopy(obj.Object, "status", "v4availableIPs")
+	value, found, _ := unstructured.NestedFieldNoCopy(obj.Object, fieldStatus, "v4availableIPs")
 	if !found {
 		return 0, false
 	}
@@ -119,10 +133,30 @@ func subnetFree(ctx context.Context, subnet string) (int64, bool) {
 }
 
 // poolCapacity returns the IPv4 capacity the device of a Subnet publishes.
+// allocatedNICs counts the NICs of the driver that allocated claims hold in the
+// pool of a Subnet, e.g. those of the demo pods and VMs. Once kube-ovn gave
+// them their address, the publisher adds them back to the free addresses.
+func allocatedNICs(ctx context.Context, subnet string) int64 {
+	claims, err := clientset.ResourceV1().ResourceClaims("").List(ctx, metav1.ListOptions{})
+	Expect(err).NotTo(HaveOccurred())
+	var n int64
+	for _, claim := range claims.Items {
+		if claim.Status.Allocation == nil {
+			continue
+		}
+		for _, result := range claim.Status.Allocation.Devices.Results {
+			if result.Driver == driverName && result.Pool == subnet {
+				n++
+			}
+		}
+	}
+	return n
+}
+
 func poolCapacity(ctx context.Context, subnet string) (int64, bool) {
 	for _, slice := range driverSlices(ctx)[subnet] {
 		for _, device := range slice.Spec.Devices {
-			if device.Name == deviceNamePrefix+subnet {
+			if device.Name == publisher.DeviceName(subnet) {
 				capacity, ok := device.Capacity[capacityIPv4]
 				return capacity.Value.Value(), ok
 			}
@@ -236,14 +270,19 @@ var _ = Describe("kube-ovn NIC DRA driver in central publish mode", Ordered, fun
 
 	BeforeAll(func() {
 		if !publisherRunning(ctx) {
-			Skip("the driver runs in node mode; deploy it with PUBLISH_MODE=central to run these specs")
+			Skip(msgSkipNodeMode)
 		}
 	})
 
 	It("publishes one pool per subnet, named after the subnet, and no pool per node", func() {
 		Eventually(func(g Gomega) {
 			pools := driverSlices(ctx)
-			for _, subnet := range subnetNames(ctx) {
+			published, unpublished := subnetNames(ctx)
+			g.Expect(unpublished).To(ContainElement("join"), "join uses the default provider")
+			for _, subnet := range unpublished {
+				g.Expect(pools).NotTo(HaveKey(subnet), "subnet %s cannot back a DRA NIC", subnet)
+			}
+			for _, subnet := range published {
 				if strings.HasPrefix(subnet, capacitySubnet) {
 					continue
 				}
@@ -256,7 +295,7 @@ var _ = Describe("kube-ovn NIC DRA driver in central publish mode", Ordered, fun
 						devices = append(devices, device.Name)
 					}
 				}
-				g.Expect(devices).To(Equal([]string{deviceNamePrefix + subnet}), "pool %s", subnet)
+				g.Expect(devices).To(Equal([]string{publisher.DeviceName(subnet)}), "pool %s", subnet)
 			}
 		}, defaultTimeout, pollInterval).Should(Succeed())
 	})
@@ -276,25 +315,26 @@ var _ = Describe("kube-ovn NIC DRA driver in central publish mode", Ordered, fun
 			free, hasFree := subnetFree(ctx, overlaySubnet)
 			capacity, hasCapacity := poolCapacity(ctx, overlaySubnet)
 			g.Expect(hasFree && hasCapacity).To(BeTrue(), "subnet %s has no free count or capacity yet", overlaySubnet)
-			// No claim holds an address of this subnet before the other specs ran.
-			g.Expect(capacity).To(Equal(free))
+			// The subnet counts the addresses of allocated claims as used, the
+			// scheduler subtracts the claims again, so the publisher adds them back.
+			g.Expect(capacity).To(Equal(free + allocatedNICs(ctx, overlaySubnet)))
 		}, defaultTimeout, pollInterval).Should(Succeed())
 	})
 
-	Context("VLAN underlay subnets", Label("containerlab"), func() {
+	Context("VLAN underlay subnets", Label(labelContainerlab), func() {
 		BeforeEach(func() {
 			if !containerlabEnabled() {
-				Skip("set E2E_CONTAINERLAB=1 (and run `make clab-deploy`) to exercise the VLAN underlay")
+				Skip(msgSkipContainerlab)
 			}
 		})
 
 		It("makes a VLAN subnet available on the nodes where its provider network is ready", func() {
 			subnet, err := dynClient.Resource(subnetGVR).Get(ctx, underlaySubnet, metav1.GetOptions{})
 			Expect(err).NotTo(HaveOccurred())
-			vlanName, _, _ := unstructured.NestedString(subnet.Object, "spec", "vlan")
+			vlanName, _, _ := unstructured.NestedString(subnet.Object, fieldSpec, fieldVlan)
 			vlan, err := dynClient.Resource(vlanGVR).Get(ctx, vlanName, metav1.GetOptions{})
 			Expect(err).NotTo(HaveOccurred())
-			providerNetwork, _, _ := unstructured.NestedString(vlan.Object, "spec", "provider")
+			providerNetwork, _, _ := unstructured.NestedString(vlan.Object, fieldSpec, fieldProvider)
 			Expect(providerNetwork).NotTo(BeEmpty())
 
 			slices := driverSlices(ctx)[underlaySubnet]
@@ -307,7 +347,7 @@ var _ = Describe("kube-ovn NIC DRA driver in central publish mode", Ordered, fun
 
 				pn, err := dynClient.Resource(providerNetworkGVR).Get(ctx, providerNetwork, metav1.GetOptions{})
 				Expect(err).NotTo(HaveOccurred())
-				ready, _, _ := unstructured.NestedStringSlice(pn.Object, "status", "readyNodes")
+				ready, _, _ := unstructured.NestedStringSlice(pn.Object, fieldStatus, "readyNodes")
 				sort.Strings(ready)
 				Expect(selectedNodes(ctx, slice.Spec.NodeSelector)).To(Equal(ready),
 					"the pool selects exactly the ready nodes of provider network %s", providerNetwork)
@@ -317,15 +357,17 @@ var _ = Describe("kube-ovn NIC DRA driver in central publish mode", Ordered, fun
 
 	It("refuses a pod at scheduling time when the pool is exhausted, and admits it again after a release", func() {
 		cleanup := func() {
-			_, _ = kubectl("delete", "pod,resourceclaim", "-l", capacityLabel, "--ignore-not-found", "--wait=true")
-			_, _ = kubectl("delete", "subnet", "-l", capacityLabel, "--ignore-not-found", "--wait=true")
+			_, _ = kubectl(kubectlDelete, podsAndClaims, flagSelector, capacityLabel, flagIgnoreNotFound, flagWait)
+			_, _ = kubectl(kubectlDelete, "subnet", flagSelector, capacityLabel, flagIgnoreNotFound, flagWait)
 		}
 		cleanup()
 		DeferCleanup(cleanup)
+		// Registered after the cleanup, so it reports before the pods are gone.
+		DeferCleanup(startCapacityRecorder(ctx).stopAndReport)
 
 		By("creating a small subnet and waiting for its pool to publish the free addresses")
-		out, err := kubectlStdin(capacityManifest(), "apply", "-f", "-")
-		Expect(err).NotTo(HaveOccurred(), "kubectl apply: %s", out)
+		out, err := kubectlStdin(capacityManifest(), kubectlApply, flagFile, "-")
+		Expect(err).NotTo(HaveOccurred(), msgKubectlApply, out)
 		var free int64
 		Eventually(func(g Gomega) {
 			var ok bool
@@ -337,19 +379,24 @@ var _ = Describe("kube-ovn NIC DRA driver in central publish mode", Ordered, fun
 			g.Expect(capacity).To(Equal(free))
 		}, defaultTimeout, pollInterval).Should(Succeed())
 
-		By(fmt.Sprintf("filling the pool with %d pods that each take an address", free))
+		// One pod at a time: while claims of a pool are still being bound,
+		// kube-scheduler (1.36) counts their consumed capacity twice, once from
+		// its assume cache and once as in-flight allocations, and can refuse a
+		// pod the pool has room for. Nothing requeues that pod until the
+		// unschedulable pods are flushed after 5 minutes.
+		By(fmt.Sprintf("filling the pool with %d pods that each take an address, one at a time", free))
 		var pods []string
 		for i := int64(0); i < free; i++ {
 			pods = append(pods, fmt.Sprintf("%s%d", capacityPodNamePref, i))
+			out, err = kubectlStdin(capacityManifest(pods...), kubectlApply, flagFile, "-")
+			Expect(err).NotTo(HaveOccurred(), msgKubectlApply, out)
+			waitRunning(pods[i])
 		}
-		out, err = kubectlStdin(capacityManifest(pods...), "apply", "-f", "-")
-		Expect(err).NotTo(HaveOccurred(), "kubectl apply: %s", out)
-		waitRunning(pods...)
 
 		By("a pod that does not fit staying unscheduled, not stuck in container creation")
 		over := capacityPodNamePref + "over"
-		out, err = kubectlStdin(capacityManifest(append(pods, over)...), "apply", "-f", "-")
-		Expect(err).NotTo(HaveOccurred(), "kubectl apply: %s", out)
+		out, err = kubectlStdin(capacityManifest(append(pods, over)...), kubectlApply, flagFile, "-")
+		Expect(err).NotTo(HaveOccurred(), msgKubectlApply, out)
 		Eventually(func(g Gomega) {
 			pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, over, metav1.GetOptions{})
 			g.Expect(err).NotTo(HaveOccurred())
@@ -363,12 +410,12 @@ var _ = Describe("kube-ovn NIC DRA driver in central publish mode", Ordered, fun
 			g.Expect(unschedulable).To(BeTrue(), "the pod is not reported unschedulable yet")
 		}, defaultTimeout, pollInterval).Should(Succeed())
 		Consistently(func() (string, error) {
-			return kubectl("get", "pod", over, "-o", "jsonpath={.spec.nodeName}")
+			return kubectl(kubectlGet, resourcePod, over, flagOutput, "jsonpath={.spec.nodeName}")
 		}, 20*time.Second, pollInterval).Should(BeEmpty())
 
 		By("the pod being admitted once a pod released its address")
-		out, err = kubectl("delete", "pod,resourceclaim", pods[0], "--wait=true")
-		Expect(err).NotTo(HaveOccurred(), "kubectl delete: %s", out)
+		out, err = kubectl(kubectlDelete, podsAndClaims, pods[0], flagWait)
+		Expect(err).NotTo(HaveOccurred(), msgKubectlDelete, out)
 		waitRunning(over)
 	})
 })

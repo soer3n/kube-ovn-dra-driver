@@ -20,6 +20,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -45,6 +46,9 @@ const (
 	sharedSubnetRelPath = "demo/nic-example/examples/shared-subnet.yaml"
 	// sameSubnetRelPath is one pod with two NICs on ovn-subnet.
 	sameSubnetRelPath = "demo/nic-example/examples/same-subnet-2nic.yaml"
+	// firstAvailableRelPath is one claim with two firstAvailable requests that
+	// fall back to ovn-subnet, with the interface names on the parent requests.
+	firstAvailableRelPath = "demo/nic-example/examples/first-available.yaml"
 )
 
 // Names from the demo fixtures. The underlay gateway is the FRR gateway on
@@ -52,54 +56,75 @@ const (
 const (
 	twoNICPod         = "nic-demo-2"
 	sameSubnetPod     = "same-subnet-2nic"
-	underlaySubnet    = "vlan100-subnet"
-	overlaySubnet     = "ovn-subnet"
-	underlayGatewayIP = "172.23.0.253"
+	firstAvailablePod = "first-available"
+	// firstAvailableClaim and fallbackSubrequest are from first-available.yaml.
+	firstAvailableClaim = "first-available"
+	fallbackSubrequest  = "fallback"
+	// providersAnnotation is where kube-ovn-controller records the subnet and
+	// provider of each NIC on its claim.
+	providersAnnotation = "ovn.kubernetes.io/dra_providers"
+	underlaySubnet      = "vlan100-subnet"
+	overlaySubnet       = "ovn-subnet"
+	underlayGatewayIP   = "172.23.0.253"
+	sharedPodA          = "shared-a"
+	sharedPodB          = "shared-b"
+	parentDir           = ".."
 )
 
 func repoRoot() string {
 	_, file, _, _ := runtime.Caller(0)
-	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	return filepath.Clean(filepath.Join(filepath.Dir(file), parentDir, parentDir))
 }
 
 func kubectl(args ...string) (string, error) {
-	cmd := exec.Command("kubectl", args...)
+	cmd := exec.Command(kubectlBinary, args...)
 	cmd.Dir = repoRoot()
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// pingFrom pings ip three times through the pod's iface.
+func pingFrom(pod, iface, ip string) (string, error) {
+	return kubectl(kubectlExec, pod, argsEnd, "ping", flagPingCount, "3", "-W", "2", "-I", iface, ip)
+}
+
+// providerKey is the key kube-ovn gives a NIC that shares its provider with
+// another NIC of the pod: "<provider>.<interface>".
+func providerKey(provider, iface string) string {
+	return provider + "." + iface
 }
 
 // useFixture applies a fixture for the current spec and removes it afterwards.
 // It also removes leftovers of an earlier run first.
 func useFixture(relPath string) {
 	fixture := filepath.Join(repoRoot(), relPath)
-	_, _ = kubectl("delete", "-f", fixture, "--ignore-not-found", "--wait=true")
+	_, _ = kubectl(kubectlDelete, flagFile, fixture, flagIgnoreNotFound, flagWait)
 	DeferCleanup(func() {
-		_, _ = kubectl("delete", "-f", fixture, "--ignore-not-found", "--wait=true")
+		_, _ = kubectl(kubectlDelete, flagFile, fixture, flagIgnoreNotFound, flagWait)
 	})
-	out, err := kubectl("apply", "-f", fixture)
-	Expect(err).NotTo(HaveOccurred(), "kubectl apply: %s", out)
+	out, err := kubectl(kubectlApply, flagFile, fixture)
+	Expect(err).NotTo(HaveOccurred(), msgKubectlApply, out)
 }
 
 func waitRunning(pods ...string) {
 	for _, pod := range pods {
 		Eventually(func() (string, error) {
-			return kubectl("get", "pod", pod, "-o", "jsonpath={.status.phase}")
-		}, defaultTimeout, pollInterval).Should(Equal("Running"), "pod %s", pod)
+			return kubectl(kubectlGet, resourcePod, pod, flagOutput, "jsonpath={.status.phase}")
+		}, defaultTimeout, pollInterval).Should(Equal(phaseRunning), "pod %s", pod)
 	}
 }
 
 func subnetProvider(ctx context.Context, subnet string) string {
 	obj, err := dynClient.Resource(subnetGVR).Get(ctx, subnet, metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred(), "get subnet %s", subnet)
-	provider, _, _ := unstructured.NestedString(obj.Object, "spec", "provider")
+	provider, _, _ := unstructured.NestedString(obj.Object, fieldSpec, fieldProvider)
 	Expect(provider).NotTo(BeEmpty(), "subnet %s has no provider", subnet)
 	return provider
 }
 
 // expectNIC checks that kube-ovn-controller allocated the NIC keyed by key and
-// that the driver configured that address on iface in the pod. It returns the
-// address.
+// that the driver configured its addresses on iface in the pod. It returns the
+// address annotation, which holds one address per family, comma separated.
 func expectNIC(ctx context.Context, pod, iface, key string) string {
 	p, err := clientset.CoreV1().Pods(namespace).Get(ctx, pod, metav1.GetOptions{})
 	Expect(err).NotTo(HaveOccurred())
@@ -107,9 +132,12 @@ func expectNIC(ctx context.Context, pod, iface, key string) string {
 	ip := p.Annotations[key+".kubernetes.io/ip_address"]
 	Expect(ip).NotTo(BeEmpty(), "pod %s NIC %s has no address", pod, key)
 
-	Eventually(func() (string, error) {
-		return kubectl("exec", pod, "--", "ip", "-o", "addr", "show", "dev", iface)
-	}, defaultTimeout, pollInterval).Should(ContainSubstring(ip+"/"), "pod %s %s should carry %s", pod, iface, ip)
+	for addr := range strings.SplitSeq(ip, ",") {
+		Eventually(func() ([]string, error) {
+			l, err := linkShow(pod, iface)
+			return l.ips(), err
+		}, defaultTimeout, pollInterval).Should(ContainElement(addr), "pod %s %s should carry %s", pod, iface, addr)
+	}
 	return ip
 }
 
@@ -139,29 +167,42 @@ var _ = Describe("kube-ovn NIC DRA driver", func() {
 			}
 			for _, dev := range slice.Spec.Devices {
 				devices++
-				if _, ok := dev.Attributes[resourcev1.QualifiedName("nic.kubeovn.io/subnetName")]; ok {
+				if _, ok := dev.Attributes[resourcev1.QualifiedName("subnetName")]; ok {
 					sawSubnetAttr = true
 				}
 			}
 		}
 		Expect(devices).To(BeNumerically(">", 0), "expected at least one %s device in a ResourceSlice", driverName)
-		Expect(sawSubnetAttr).To(BeTrue(), "expected a device with the nic.kubeovn.io/subnetName attribute")
+		Expect(sawSubnetAttr).To(BeTrue(), "expected a device with the subnetName attribute")
 	})
 
-	It("plugs the NICs kube-ovn-controller allocates and releases them with the pod", func() {
+	// The fixture puts net1 on a VLAN subnet, which is only published where its
+	// ProviderNetwork is ready, i.e. with the containerlab fabric.
+	It("plugs the NICs kube-ovn-controller allocates, wires the VLAN NIC through its provider network and releases them with the pod", Label(labelContainerlab), func() {
+		if !containerlabEnabled() {
+			Skip(msgSkipContainerlab)
+		}
 		useFixture(twoNICRelPath)
 		waitRunning(twoNICPod)
 		underlay, overlay := subnetProvider(ctx, underlaySubnet), subnetProvider(ctx, overlaySubnet)
 
 		By("each NIC carrying the address kube-ovn-controller allocated")
-		expectNIC(ctx, twoNICPod, "net1", underlay)
-		expectNIC(ctx, twoNICPod, "net2", overlay)
+		expectNIC(ctx, twoNICPod, ifaceNet1, underlay)
+		expectNIC(ctx, twoNICPod, ifaceNet2, overlay)
 		Expect(ipCRExists(ctx, twoNICPod, underlay)).To(BeTrue())
 		Expect(ipCRExists(ctx, twoNICPod, overlay)).To(BeTrue())
 
+		By("pinging the FRR gateway " + underlayGatewayIP + " from the underlay NIC")
+		Eventually(func() (string, error) {
+			out, err := pingFrom(twoNICPod, ifaceNet1, underlayGatewayIP)
+			return strings.TrimSpace(out), err
+		}, defaultTimeout, pollInterval).Should(ContainSubstring(noPacketLoss))
+
+		expectVLANWiring(ctx)
+
 		By("kube-ovn-controller releasing the addresses when the pod is deleted")
-		out, err := kubectl("delete", "-f", filepath.Join(repoRoot(), twoNICRelPath), "--wait=true")
-		Expect(err).NotTo(HaveOccurred(), "kubectl delete: %s", out)
+		out, err := kubectl(kubectlDelete, flagFile, filepath.Join(repoRoot(), twoNICRelPath), flagWait)
+		Expect(err).NotTo(HaveOccurred(), msgKubectlDelete, out)
 		Eventually(func() bool {
 			return ipCRExists(ctx, twoNICPod, underlay) || ipCRExists(ctx, twoNICPod, overlay)
 		}, defaultTimeout, pollInterval).Should(BeFalse())
@@ -172,44 +213,59 @@ var _ = Describe("kube-ovn NIC DRA driver", func() {
 		waitRunning(sameSubnetPod)
 		provider := subnetProvider(ctx, overlaySubnet)
 
-		ip1 := expectNIC(ctx, sameSubnetPod, "net1", provider+".net1")
-		ip2 := expectNIC(ctx, sameSubnetPod, "net2", provider+".net2")
+		ip1 := expectNIC(ctx, sameSubnetPod, ifaceNet1, providerKey(provider, ifaceNet1))
+		ip2 := expectNIC(ctx, sameSubnetPod, ifaceNet2, providerKey(provider, ifaceNet2))
 		Expect(ip1).NotTo(Equal(ip2))
-		Expect(ipCRExists(ctx, sameSubnetPod, provider+".net1")).To(BeTrue())
-		Expect(ipCRExists(ctx, sameSubnetPod, provider+".net2")).To(BeTrue())
+		Expect(ipCRExists(ctx, sameSubnetPod, providerKey(provider, ifaceNet1))).To(BeTrue())
+		Expect(ipCRExists(ctx, sameSubnetPod, providerKey(provider, ifaceNet2))).To(BeTrue())
+
+		By("kube-ovn-controller releasing the addresses when the pod is deleted")
+		out, err := kubectl(kubectlDelete, flagFile, filepath.Join(repoRoot(), sameSubnetRelPath), flagWait)
+		Expect(err).NotTo(HaveOccurred(), msgKubectlDelete, out)
+		Eventually(func() bool {
+			return ipCRExists(ctx, sameSubnetPod, providerKey(provider, ifaceNet1)) || ipCRExists(ctx, sameSubnetPod, providerKey(provider, ifaceNet2))
+		}, defaultTimeout, pollInterval).Should(BeFalse())
+	})
+
+	It("resolves firstAvailable requests and names their NICs after the parent request's config", func() {
+		useFixture(firstAvailableRelPath)
+		waitRunning(firstAvailablePod)
+		provider := subnetProvider(ctx, overlaySubnet)
+
+		ip1 := expectNIC(ctx, firstAvailablePod, ifaceNet1, providerKey(provider, ifaceNet1))
+		ip2 := expectNIC(ctx, firstAvailablePod, ifaceNet2, providerKey(provider, ifaceNet2))
+		Expect(ip1).NotTo(Equal(ip2))
+
+		claim, err := clientset.ResourceV1().ResourceClaims(namespace).Get(ctx, firstAvailableClaim, metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		for _, result := range claim.Status.Allocation.Devices.Results {
+			Expect(result.Request).To(HaveSuffix("/"+fallbackSubrequest), "request %s should be allocated by its fallback", result.Request)
+		}
+		By("checking the subnet and provider kube-ovn-controller recorded on the claim")
+		records := map[string]struct {
+			Subnet   string `json:"subnet"`
+			Provider string `json:"provider"`
+		}{}
+		Expect(json.Unmarshal([]byte(claim.Annotations[providersAnnotation]), &records)).To(Succeed())
+		Expect(records).NotTo(BeEmpty())
+		for device, record := range records {
+			Expect(record.Subnet).To(Equal(overlaySubnet), "device %s", device)
+			Expect(record.Provider).To(Equal(provider), "device %s", device)
+		}
 	})
 
 	It("connects pods that share a subnet over the overlay", func() {
 		useFixture(sharedSubnetRelPath)
-		waitRunning("shared-a", "shared-b")
+		waitRunning(sharedPodA, sharedPodB)
 		provider := subnetProvider(ctx, overlaySubnet)
 
-		ipA := expectNIC(ctx, "shared-a", "net1", provider)
-		ipB := expectNIC(ctx, "shared-b", "net1", provider)
+		ipA := expectNIC(ctx, sharedPodA, ifaceNet1, provider)
+		ipB := expectNIC(ctx, sharedPodB, ifaceNet1, provider)
 		Expect(ipA).NotTo(Equal(ipB))
 
 		By("pinging shared-b's NIC from shared-a")
 		Eventually(func() (string, error) {
-			return kubectl("exec", "shared-a", "--", "ping", "-c", "3", "-W", "2", "-I", "net1", ipB)
-		}, defaultTimeout, pollInterval).Should(ContainSubstring(" 0% packet loss"))
-	})
-
-	Context("VLAN underlay datapath", Label("containerlab"), func() {
-		BeforeEach(func() {
-			if !containerlabEnabled() {
-				Skip("set E2E_CONTAINERLAB=1 (and run `make clab-deploy`) to exercise the VLAN underlay")
-			}
-		})
-
-		It("reaches the external VLAN gateway over the underlay NIC", func() {
-			useFixture(twoNICRelPath)
-			waitRunning(twoNICPod)
-
-			By("pinging the FRR gateway " + underlayGatewayIP + " from the underlay NIC")
-			Eventually(func() (string, error) {
-				out, err := kubectl("exec", twoNICPod, "--", "ping", "-c", "3", "-W", "2", "-I", "net1", underlayGatewayIP)
-				return strings.TrimSpace(out), err
-			}, defaultTimeout, pollInterval).Should(ContainSubstring(" 0% packet loss"))
-		})
+			return pingFrom(sharedPodA, ifaceNet1, ipB)
+		}, defaultTimeout, pollInterval).Should(ContainSubstring(noPacketLoss))
 	})
 })

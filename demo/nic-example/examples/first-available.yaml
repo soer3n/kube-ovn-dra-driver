@@ -1,0 +1,73 @@
+# Two secondary NICs of one pod from one claim whose requests use firstAvailable:
+# each prefers a subnet that does not exist and falls back to ovn-subnet (OVN
+# overlay, no containerlab needed). The interfaceName comes from a NicConfig of
+# the parent request, which applies to the subrequest the allocator picked.
+#
+#   kubectl apply -f demo/nic-example/examples/first-available.yaml
+#   kubectl get resourceclaim first-available -o jsonpath='{.status.allocation.devices.results[*].request}'
+#   kubectl exec first-available -- ip -br addr
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: first-available
+  namespace: default
+spec:
+  devices:
+    requests:
+      - name: nic1
+        firstAvailable:
+          - name: preferred
+            deviceClassName: nic.kubeovn.io
+            selectors:
+              - cel:
+                  expression: "device.attributes['nic.kubeovn.io'].subnetName == 'does-not-exist'"
+          - name: fallback
+            deviceClassName: nic.kubeovn.io
+            selectors:
+              - cel:
+                  expression: "device.attributes['nic.kubeovn.io'].subnetName == 'ovn-subnet'"
+      - name: nic2
+        firstAvailable:
+          - name: preferred
+            deviceClassName: nic.kubeovn.io
+            selectors:
+              - cel:
+                  expression: "device.attributes['nic.kubeovn.io'].subnetName == 'does-not-exist'"
+          - name: fallback
+            deviceClassName: nic.kubeovn.io
+            selectors:
+              - cel:
+                  expression: "device.attributes['nic.kubeovn.io'].subnetName == 'ovn-subnet'"
+    config:
+      - requests: ["nic1"]
+        opaque:
+          driver: nic.kubeovn.io
+          parameters:
+            apiVersion: nic.resource.kube-ovn.io/v1alpha1
+            kind: NicConfig
+            interfaceName: net1
+      - requests: ["nic2"]
+        opaque:
+          driver: nic.kubeovn.io
+          parameters:
+            apiVersion: nic.resource.kube-ovn.io/v1alpha1
+            kind: NicConfig
+            interfaceName: net2
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: first-available
+  namespace: default
+spec:
+  resourceClaims:
+    - name: nics
+      resourceClaimName: first-available
+  containers:
+    - name: demo
+      image: nicolaka/netshoot@sha256:47b907d662d139d1e2f22bfe14f4efca1e3f1feed283572f47c970c780c03b61
+      command: ["sleep", "infinity"]
+      resources:
+        claims:
+          - name: nics

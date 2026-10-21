@@ -29,6 +29,17 @@
 //   - specs labelled "containerlab" exercise the VLAN underlay datapath and need
 //     `make clab-deploy` (sudo + containerlab); they are skipped unless
 //     E2E_CONTAINERLAB=1.
+//   - specs labelled "kubevirt" live-migrate KubeVirt VMs and need KubeVirt with
+//     the kube-ovn-nic binding and two workers (`E2E_KUBEVIRT=1 make
+//     setup-e2e`); they are skipped unless E2E_KUBEVIRT=1. The spec also
+//     labelled "rwx" needs CDI and a ReadWriteMany storage class (E2E_RWX=1),
+//     the one also labelled "containerlab" the VLAN underlay as well.
+//   - specs labelled "dual" need a dual-stack cluster (`E2E_IP_FAMILY=dual make
+//     setup-e2e`); they are skipped unless E2E_IP_FAMILY=dual.
+//
+// The driver runs in central publish mode unless the cluster is set up with
+// E2E_PUBLISH_MODE=node. The specs of one mode find out which mode runs and skip
+// in the other.
 package e2e
 
 import (
@@ -39,10 +50,22 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/soer3n/kube-ovn-dra-driver/internal/publisher"
+)
+
+// Values shared by the tests of this package.
+const (
+	labelContainerlab     = "containerlab"
+	msgSkipContainerlab   = "set E2E_CONTAINERLAB=1 (and run `make clab-deploy`) to exercise the VLAN underlay"
+	msgKubectlDelete      = "kubectl delete: %s"
+	msgSkipNodeMode       = "the driver runs in node mode; set it up with E2E_PUBLISH_MODE=central to run these specs"
+	msgSkipCentralMode    = "the driver runs in central mode; set it up with E2E_PUBLISH_MODE=node to run these specs"
+	msgSkipNodeBoundClaim = "the driver runs in node mode, where a named claim is bound to the pool of one node and cannot follow a VM to another node"
+	phaseRunning          = "Running"
 )
 
 const (
@@ -55,9 +78,40 @@ const (
 	pollInterval   = 5 * time.Second
 )
 
+// kubectl verbs and flags, and the names the specs share.
+const (
+	kubectlApply       = "apply"
+	kubectlBinary      = "kubectl"
+	kubectlDelete      = "delete"
+	kubectlGet         = "get"
+	kubectlExec        = "exec"
+	flagFile           = "-f"
+	flagIgnoreNotFound = "--ignore-not-found"
+	flagWait           = "--wait=true"
+	flagSelector       = "-l"
+	flagOutput         = "-o"
+	flagNamespace      = "-n"
+	argsEnd            = "--"
+	flagContainer      = "-c"
+	flagPingCount      = "-c"
+	resourcePod        = "pod"
+	msgKubectlApply    = "kubectl apply: %s"
+	msgOvsVsctl        = "ovs-vsctl: %s"
+	podsAndClaims      = "pod,resourceclaim"
+
+	kubeSystemNS  = "kube-system"
+	ifaceNet1     = "net1"
+	ifaceNet2     = "net2"
+	fieldSpec     = "spec"
+	fieldStatus   = "status"
+	fieldVlan     = "vlan"
+	fieldProvider = "provider"
+	noPacketLoss  = " 0% packet loss"
+)
+
 var (
-	ipGVR     = schema.GroupVersionResource{Group: "kubeovn.io", Version: "v1", Resource: "ips"}
-	subnetGVR = schema.GroupVersionResource{Group: "kubeovn.io", Version: "v1", Resource: "subnets"}
+	ipGVR     = publisher.IPGVR
+	subnetGVR = publisher.SubnetGVR
 )
 
 var (
@@ -69,6 +123,25 @@ var (
 // should run. They need the host-side clab topology, so they are opt-in.
 func containerlabEnabled() bool {
 	return os.Getenv("E2E_CONTAINERLAB") == "1"
+}
+
+// kubevirtEnabled reports whether the live migration specs should run. They
+// need KubeVirt with the kube-ovn-nic binding and two workers, so they are
+// opt-in.
+func kubevirtEnabled() bool {
+	return os.Getenv("E2E_KUBEVIRT") == "1"
+}
+
+// dualEnabled reports whether the cluster is dual-stack, which the dual-stack
+// and IPv6-only specs need.
+func dualEnabled() bool {
+	return os.Getenv("E2E_IP_FAMILY") == "dual"
+}
+
+// rwxEnabled reports whether the DataVolume migration spec should run. It also
+// needs CDI and a ReadWriteMany storage class.
+func rwxEnabled() bool {
+	return os.Getenv("E2E_RWX") == "1"
 }
 
 func TestE2E(t *testing.T) {

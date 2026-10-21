@@ -5,7 +5,7 @@ Produces, under demo/nic-example/:
   - 00-kube-ovn-subnets.yaml        (ProviderNetwork + 8 VLAN + 8 overlay subnets)
   - examples/<N>nic.yaml            (ResourceClaim + netshoot Pod with N NICs)
 
-and prints the containerlab / FRR / bridge snippets needed for the VLAN underlay
+and prints the containerlab (frr-gw sub-interfaces) and bridge snippets needed for the VLAN underlay
 to actually pass traffic (these are host-side and applied by `make clab-deploy`).
 
 The demo attaches an equal split of underlay (VLAN) and overlay (OVN) NICs to a
@@ -401,13 +401,6 @@ def print_clab_snippets():
     print("\n# ---- Makefile clab-deploy: bridge vlan allows ----")
     vids = ",".join(str(underlay(i)["id"]) for i in range(1, MAX_PAIRS + 1))
     print(f"        for vid in {vids}; do for p in port1 port2 port3; do sudo bridge vlan add vid $$vid dev $$p; done; done")
-    print("\n# ---- frr.conf VLAN-SUBNETS prefix-list ----")
-    seq = 10
-    for i in range(1, MAX_PAIRS + 1):
-        u = underlay(i)
-        net = u["cidr"]
-        print(f"ip prefix-list VLAN-SUBNETS seq {seq} permit {net} le 32")
-        seq += 10
 
 
 # ---------------------------------------------------------------------------

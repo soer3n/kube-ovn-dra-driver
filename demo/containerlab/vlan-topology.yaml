@@ -1,9 +1,8 @@
 # Containerlab topology: VLAN switch + FRR gateway wired to all kind nodes as eth1.
 #
-# FRR (frr-gw) peers with kube-ovn-speaker on each node via eBGP and
-# redistributes VLAN subnet routes into the host kernel — no manual
-# `ip route add` required. The host reaches pods via the FRR container's
-# VLAN sub-interfaces.
+# frr-gw runs in the host network namespace and gives its eth1 trunk one
+# sub-interface per VLAN with the subnet's gateway address, so pods reach their
+# gateway over L2 and the host has a connected route to every VLAN subnet.
 #
 # Node names must match `kind get nodes` output:
 #   nic-dra-demo-control-plane, nic-dra-demo-worker
@@ -28,17 +27,14 @@ topology:
     vlan-switch:
       kind: bridge
 
-    # FRR gateway: BGP router that peers with kube-ovn-speaker on each node
-    # and installs VLAN subnet routes into the host via kernel netlink.
-    #
-    # eth1 is a trunk port on vlan-switch. FRR creates VLAN sub-interfaces
-    # internally and announces/learns routes over BGP ASN 65000 (kube-ovn)
-    # <-> ASN 65001 (this router).
+    # FRR gateway: the L3 gateway of the VLAN subnets. eth1 is a trunk port on
+    # vlan-switch; the exec commands below create one 802.1q sub-interface per
+    # VLAN with the gateway address.
     frr-gw:
       kind: linux
       image: quay.io/frrouting/frr:10.2.1
-      # Keep the container connected to the host network namespace so that
-      # BGP-learned routes are installed into the host routing table.
+      # In the host network namespace, so the host has connected routes to the
+      # VLAN subnets through the sub-interfaces.
       network-mode: host
       binds:
         - frr/frr.conf:/etc/frr/frr.conf:ro
@@ -72,6 +68,9 @@ topology:
         - ip link add link eth1 name eth1.1106 type vlan id 1106
         - ip link add link eth1 name eth1.1107 type vlan id 1107
         - ip link add link eth1 name eth1.1108 type vlan id 1108
+        # Capacity demo VLAN (binding plugin demo/10-capacity-demo.yaml):
+        # VLAN 900 -> 172.31.0.253/24 gateway.
+        - ip link add link eth1 name eth1.900 type vlan id 900
         - ip addr add 172.23.0.253/24 dev eth1.100
         - ip addr add 172.24.0.253/24 dev eth1.200
         - ip addr add 172.25.0.253/24 dev eth1.300
@@ -88,6 +87,7 @@ topology:
         - ip addr add 10.216.0.1/24 dev eth1.1106
         - ip addr add 10.217.0.1/24 dev eth1.1107
         - ip addr add 10.218.0.1/24 dev eth1.1108
+        - ip addr add 172.31.0.253/24 dev eth1.900
         - ip link set eth1.100 up
         - ip link set eth1.200 up
         - ip link set eth1.300 up
@@ -104,6 +104,7 @@ topology:
         - ip link set eth1.1106 up
         - ip link set eth1.1107 up
         - ip link set eth1.1108 up
+        - ip link set eth1.900 up
         - /usr/lib/frr/frrinit.sh start
 
     # kind control-plane

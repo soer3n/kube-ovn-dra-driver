@@ -126,6 +126,35 @@ generate-deepcopy:
 
 KIND_CLUSTER_NAME ?= nic-dra-demo
 KIND_CONFIG       ?= $(CURDIR)/demo/kind/kind-no-cni.yaml
+# IP families of the cluster: ipv4, or dual for dual-stack. kind-create derives a
+# dual-stack variant of KIND_CONFIG, kind-deploy-kube-ovn sets kube-ovn's
+# NET_STACK and CIDRs to match.
+IP_FAMILY         ?= ipv4
+POD_CIDR_V4       = 10.244.0.0/16
+POD_GATEWAY_V4    = 10.244.0.1
+SVC_CIDR_V4       = 10.96.0.0/12
+JOIN_CIDR_V4      = 100.64.0.0/16
+POD_CIDR_V6       = fd00:10:244::/112
+POD_GATEWAY_V6    = fd00:10:244::1
+SVC_CIDR_V6       = fd00:10:96::/112
+JOIN_CIDR_V6      = fd00:100:64::/112
+# kube-controller-manager hands each node a /64 of the pod range, so kind's
+# needs to be larger than kube-ovn's, which kube-ovn manages itself.
+KIND_POD_CIDR_V6  = fd00:10:244::/56
+ifeq ($(IP_FAMILY),dual)
+# helm splits --set values at commas unless they are escaped
+KUBE_OVN_STACK_ARGS = --set networking.NET_STACK=dual_stack \
+	--set 'dual_stack.POD_CIDR=$(POD_CIDR_V4)\,$(POD_CIDR_V6)' \
+	--set 'dual_stack.POD_GATEWAY=$(POD_GATEWAY_V4)\,$(POD_GATEWAY_V6)' \
+	--set 'dual_stack.SVC_CIDR=$(SVC_CIDR_V4)\,$(SVC_CIDR_V6)' \
+	--set 'dual_stack.JOIN_CIDR=$(JOIN_CIDR_V4)\,$(JOIN_CIDR_V6)'
+else
+KUBE_OVN_STACK_ARGS = --set networking.NET_STACK=ipv4 \
+	--set ipv4.POD_CIDR=$(POD_CIDR_V4) \
+	--set ipv4.POD_GATEWAY=$(POD_GATEWAY_V4) \
+	--set ipv4.SVC_CIDR=$(SVC_CIDR_V4) \
+	--set ipv4.JOIN_CIDR=$(JOIN_CIDR_V4)
+endif
 NIC_DEMO_DIR      ?= $(CURDIR)/demo/nic-example
 
 # Kubernetes node image. The demo and e2e run on Kubernetes 1.36, where the
@@ -164,7 +193,7 @@ MULTUS_VERSION    ?= v4.2.3
 # netshoot is pinned by digest.
 KUBE_OVN_REGISTRY   ?= docker.io/soer3n
 KUBE_OVN_IMAGE_REPO ?= kube-ovn
-KUBE_OVN_IMAGE_TAG  ?= dra-driver-$(KUBE_OVN_VERSION:v%=%)
+KUBE_OVN_IMAGE_TAG  ?= dra-driver-$(subst /,-,$(KUBE_OVN_VERSION:v%=%))
 KUBE_OVN_IMAGE      ?= $(KUBE_OVN_REGISTRY)/$(KUBE_OVN_IMAGE_REPO):$(KUBE_OVN_IMAGE_TAG)
 NETSHOOT_IMAGE    ?= docker.io/nicolaka/netshoot@sha256:47b907d662d139d1e2f22bfe14f4efca1e3f1feed283572f47c970c780c03b61
 # Only the kube-ovn image is preloaded: it is single-arch, so `docker pull` +
@@ -202,9 +231,9 @@ CONTAINERLAB_TOPOLOGY ?= $(CURDIR)/demo/containerlab/vlan-topology.yaml
         kind-kube-ovn-status kind-test-kube-ovn kind-test-kube-ovn-clean \
         kind-build-driver kind-deploy-driver kind-deploy-nic-prereqs kind-deploy-nic-example \
         kind-demo nic-example-deploy nic-example-clean kind-check-deps \
-        kind-deploy-kube-ovn-fixtures kind-vlan-tag-workaround \
+        kind-deploy-kube-ovn-fixtures kind-vlan-tag-workaround kind-demo-2workers \
         kind-test-vlan kind-deploy-vlan-peer \
-        clab-deploy clab-destroy clab-clean-ports kind-frr-update-peers kind-frr-status \
+        clab-deploy clab-destroy clab-clean-ports kind-vlan-status \
         kind-vlan-nat
 
 ## kind-check-deps: verify required tools are installed.
@@ -223,29 +252,26 @@ clab-deploy: clab-clean-ports
 	sudo ip link set vlan-switch up
 	@echo "Enabling VLAN filtering on bridge so 802.1q tags pass through..."
 	sudo ip link set vlan-switch type bridge vlan_filtering 1
-	@echo "Injecting node IPs into FRR config..."
-	$(MAKE) kind-frr-update-peers
 	@echo "Deploying containerlab VLAN topology + FRR gateway (requires sudo)..."
 	sudo containerlab deploy -t $(CONTAINERLAB_TOPOLOGY) --reconfigure
-	@echo "Allowing demo VLANs (100-800) and benchmark VLANs (1101-1108) on bridge ports..."
+	@echo "Allowing demo VLANs (100-800), the capacity demo VLAN (900) and benchmark VLANs (1101-1108) on bridge ports..."
 	# 1101-1108 = demo/nic-example/examples/generate.py's BENCH_VLAN_BASE(1100) + 1..MAX_VLANS(8);
 	# without these, a bench underlay pod's interface never comes up (not just "no traffic" as
 	# docs/benchmarking.md's caveat implies) since kube-ovn can never bind an untagged VLAN.
-	for vid in 100 200 300 400 500 600 700 800 1101 1102 1103 1104 1105 1106 1107 1108; do \
-		for p in port1 port2 port3; do \
+	for vid in 100 200 300 400 500 600 700 800 900 1101 1102 1103 1104 1105 1106 1107 1108; do \
+		for p in port1 port2 port3 port4; do \
+			ip link show $$p >/dev/null 2>&1 || continue; \
 			sudo bridge vlan add vid $$vid dev $$p; \
 		done; \
 	done
-	@echo "FRR gateway is up. BGP sessions will establish once kube-ovn-speaker starts."
-	@echo "Check BGP: make kind-frr-status"
+	@echo "FRR gateway is up. Check the VLAN gateways and host routes: make kind-vlan-status"
 	$(MAKE) kind-vlan-nat
 
 ## kind-vlan-nat: SNAT the demo VLAN subnets (172.23-172.30.0.0/24) out the
 ## host's own default-route interface, so a VM attached to one of them (e.g.
 ## via vlan100-subnet) can reach the real internet, not just other hosts on
-## the same VLAN trunk. FRR (clab-deploy above) only handles BGP-advertised
-## ROUTING between the fabric and the host — it does not NAT — and these
-## subnets are RFC1918 space with no other path out. Idempotent: skips a
+## the same VLAN trunk. frr-gw (clab-deploy above) is only the VLAN gateway in
+## the host network namespace — it does not NAT — and these subnets are RFC1918 space with no other path out. Idempotent: skips a
 ## rule that's already present, so repeat `make clab-deploy` runs don't pile
 ## up duplicates. Run automatically by clab-deploy; safe to re-run standalone
 ## after a host reboot (iptables rules are NOT persisted across reboots by
@@ -264,40 +290,14 @@ kind-vlan-nat:
 	done
 	@echo "Done."
 
-## kind-frr-update-peers: inject actual node IPs into the FRR config before deploy.
-## Run automatically by clab-deploy; also useful after a cluster recreate.
-kind-frr-update-peers:
-	$(eval CP_IP := $(shell kubectl get node \
-		-l node-role.kubernetes.io/control-plane \
-		-o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null))
-	$(eval W_IP := $(shell kubectl get node \
-		-l '!node-role.kubernetes.io/control-plane' \
-		-o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null))
-	@if [ -z "$(CP_IP)" ] || [ -z "$(W_IP)" ]; then \
-		echo "ERROR: Could not resolve node IPs. Is the kind cluster running?"; \
-		exit 1; \
-	fi
-	@echo "  control-plane: $(CP_IP)   worker: $(W_IP)"
-	sed \
-		-e 's/CONTROL_PLANE_IP/$(CP_IP)/g' \
-		-e 's/WORKER_IP/$(W_IP)/g' \
-		$(CURDIR)/demo/containerlab/frr/frr.conf \
-		> /tmp/frr-rendered.conf
-	sudo cp /tmp/frr-rendered.conf \
-		$(CURDIR)/demo/containerlab/clab-nic-dra-demo-vlan/frr-gw/etc/frr/frr.conf 2>/dev/null || true
-	@echo "FRR config updated with node IPs."
-
-## kind-frr-status: show BGP session state and learned routes in FRR.
-kind-frr-status:
-	@echo "=== BGP summary ==="
-	sudo docker exec clab-nic-dra-demo-vlan-frr-gw vtysh -c "show bgp summary" 2>/dev/null || \
-		echo "  (frr-gw container not running)"
+## kind-vlan-status: show the gateway sub-interfaces of frr-gw and the host's
+## connected routes to the VLAN subnets.
+kind-vlan-status:
+	@echo "=== VLAN gateway sub-interfaces (frr-gw, host network namespace) ==="
+	-@ip -br addr show | grep -E '^eth1\.' || echo "  (none — is frr-gw running? make clab-deploy)"
 	@echo ""
-	@echo "=== BGP learned routes ==="
-	sudo docker exec clab-nic-dra-demo-vlan-frr-gw vtysh -c "show bgp ipv4 unicast" 2>/dev/null || true
-	@echo ""
-	@echo "=== Host routing table (VLAN subnets installed by FRR/zebra) ==="
-	ip route show | grep -E '172\.(2[3-9]|30)\.' || echo "  (no VLAN routes yet — BGP may not be established)"
+	@echo "=== Host routes to the VLAN subnets ==="
+	-@ip route show | grep -E 'dev eth1\.' || echo "  (none)"
 
 ## clab-clean-ports: delete stale host-side veth ports from a previous deploy.
 ## containerlab names the host end of each link after the topology endpoint
@@ -307,8 +307,8 @@ kind-frr-status:
 ## netns. The next deploy then fails with "interface ... already exists".
 ## Deleting a veth removes both ends, clearing the matching eth1 in the kind node.
 clab-clean-ports:
-	@echo "Removing any stale containerlab veth ports (port1-3)..."
-	@for p in port1 port2 port3; do \
+	@echo "Removing any stale containerlab veth ports (port1-4)..."
+	@for p in port1 port2 port3 port4; do \
 		sudo ip link delete $$p 2>/dev/null && echo "  deleted $$p" || true; \
 	done
 
@@ -322,7 +322,17 @@ clab-destroy:
 
 ## kind-create: create a kind cluster with no CNI and DRA feature-gates enabled.
 kind-create: kind-check-deps
-	kind create cluster --name $(KIND_CLUSTER_NAME) --config $(KIND_CONFIG) --image $(KIND_NODE_IMAGE)
+	@set -e; cfg=$(KIND_CONFIG); \
+	if [ "$(IP_FAMILY)" = dual ]; then \
+		cfg=$$(mktemp --suffix=.yaml); \
+		sed -e 's|^networking:|networking:\n  ipFamily: dual|' \
+			-e 's|podSubnet: "$(POD_CIDR_V4)"|podSubnet: "$(POD_CIDR_V4),$(KIND_POD_CIDR_V6)"|' \
+			-e 's|serviceSubnet: "$(SVC_CIDR_V4)"|serviceSubnet: "$(SVC_CIDR_V4),$(SVC_CIDR_V6)"|' $(KIND_CONFIG) > $$cfg; \
+		grep -q 'ipFamily: dual' $$cfg && grep -q '$(KIND_POD_CIDR_V6)' $$cfg && grep -q '$(SVC_CIDR_V6)' $$cfg \
+			|| { echo "could not derive a dual-stack config from $(KIND_CONFIG)"; exit 1; }; \
+	fi; \
+	echo "kind create cluster --name $(KIND_CLUSTER_NAME) --config $$cfg --image $(KIND_NODE_IMAGE)"; \
+	kind create cluster --name $(KIND_CLUSTER_NAME) --config $$cfg --image $(KIND_NODE_IMAGE)
 	@echo "Waiting for API server to be reachable..."
 	until kubectl cluster-info --context kind-$(KIND_CLUSTER_NAME) >/dev/null 2>&1; do sleep 2; done
 	@echo "Waiting for control-plane static pods (apiserver, scheduler, etcd)..."
@@ -357,7 +367,7 @@ kind-deploy-kube-ovn: kind-preload-images
 	MASTER_NODE=$$(kubectl get nodes -l node-role.kubernetes.io/control-plane \
 		-o jsonpath='{.items[0].metadata.name}'); \
 	MASTER_IP=$$(kubectl get nodes -l node-role.kubernetes.io/control-plane \
-		-o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'); \
+		-o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' | cut -d' ' -f1); \
 	echo "Control-plane node: $$MASTER_NODE ($$MASTER_IP)"; \
 	echo "Labelling control-plane node with kube-ovn/role=master ..."; \
 	kubectl label node $$MASTER_NODE kube-ovn/role=master --overwrite; \
@@ -378,11 +388,7 @@ kind-deploy-kube-ovn: kind-preload-images
 		--set global.images.kubeovn.tag=$(KUBE_OVN_IMAGE_TAG) \
 		--set global.images.pullPolicy=IfNotPresent \
 		--set MASTER_NODES=$$MASTER_IP \
-		--set networking.NET_STACK=ipv4 \
-		--set ipv4.POD_CIDR=10.244.0.0/16 \
-		--set ipv4.POD_GATEWAY=10.244.0.1 \
-		--set ipv4.SVC_CIDR=10.96.0.0/12 \
-		--set ipv4.JOIN_CIDR=100.64.0.0/16 \
+		$(KUBE_OVN_STACK_ARGS) \
 		--set func.ENABLE_DRA_NIC=true \
 		--timeout=300s --wait; \
 	rm -rf $$CHART_TMP
@@ -437,8 +443,11 @@ kind-build-driver:
 # Who publishes the devices. "central" runs the publisher: one pool per Subnet,
 # available on the nodes of the ProviderNetwork for a VLAN Subnet, with the free
 # addresses of the Subnet as capacity. "node" lets every kubelet plugin publish a
-# pool for its node, with all Subnets and no capacity (the chart default).
+# pool for its node, with the Subnets it can serve and no capacity. Both modes
+# follow the chart value publisher.enabled, whose default is central.
 PUBLISH_MODE      ?= central
+# Extra helm arguments for kind-deploy-driver, e.g. --set kubeletPlugin.annotateVMIMAC=true
+HELM_EXTRA_ARGS   ?=
 
 ## kind-deploy-driver: install the NIC DRA kubelet-plugin via Helm, and with
 ## PUBLISH_MODE=central the publisher.
@@ -459,7 +468,7 @@ kind-deploy-driver:
 		--set image.tag=dev \
 		--set image.pullPolicy=Never \
 		--set-json 'kubeletPlugin.tolerations=[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]' \
-		--wait
+		$(HELM_EXTRA_ARGS) --wait
 
 ## kind-deploy-kube-ovn-fixtures: apply the kube-ovn underlay fixtures
 ## (ProviderNetwork, VLANs and the VLAN/overlay Subnets) and wait for reconcile.
@@ -486,12 +495,15 @@ kind-vlan-tag-workaround:
 		echo "  localnet.$$subnet tag_request=$$id"; \
 	done
 
-## wait-for-nic-devices: wait until the driver publishes every kube-ovn subnet as
-## a device. It picks up new subnets within seconds.
+## wait-for-nic-devices: wait until the driver publishes every kube-ovn subnet a
+## DRA NIC can use as a device: an OVN provider other than the default one and a
+## CIDR (join and ovn-default are not published). It picks up new subnets within
+## seconds.
 .PHONY: wait-for-nic-devices
 wait-for-nic-devices:
 	@echo "Waiting for the driver to publish all subnets..."
-	@for subnet in $$(kubectl get subnets -o jsonpath='{.items[*].metadata.name}'); do \
+	@for subnet in $$(kubectl get subnets -o jsonpath='{range .items[*]}{.metadata.name} {.spec.provider} {.spec.cidrBlock}{"\n"}{end}' \
+			| awk '$$2 != "ovn" && $$2 ~ /\.ovn$$/ && $$3 != "" {print $$1}'); do \
 		for i in $$(seq 60); do \
 			kubectl get resourceslices -o jsonpath='{range .items[?(@.spec.driver=="$(NIC_DRIVER_NAME)")]}{range .spec.devices[*]}{.name}{"\n"}{end}{end}' \
 				| grep -qx "subnet-$$subnet" && break; \
@@ -628,7 +640,7 @@ kind-deploy-vlan-peer: kind-deploy-kube-ovn-fixtures
 ## Topology (deployed by kind-deploy-vlan-peer):
 ##   vlan<N>-peer (control-plane)  net1 on vlan<N>-subnet
 ##   vlan-worker  (worker)         net1..netK across all VLAN subnets
-##   frr-gw (host-net)             eBGP with kube-ovn-speaker; .253 gateway per VLAN
+##   frr-gw (host-net)             .253 gateway per VLAN
 ##
 ## Tests, looped over every VLAN (100..800):
 ##   1. Cross-node ping: vlan-worker netI -> vlan<I00>-peer (tagged traffic over the trunk).
@@ -665,12 +677,94 @@ kind-test-vlan: kind-deploy-vlan-peer
 	@echo "=== Bridge VLAN table ==="
 	-bridge vlan show
 	@echo ""
-	@echo "=== Host routing table (VLAN subnets, via FRR/BGP if advertised) ==="
-	-ip route show | grep -E '172\.(2[3-9]|30)\.' || echo "  (no VLAN routes — kube-ovn-speaker may not advertise these subnets)"
+	@echo "=== Host routing table (VLAN subnets, connected through frr-gw's sub-interfaces) ==="
+	-ip route show | grep -E '172\.(2[3-9]|3[01])\.' || echo "  (no VLAN routes — is frr-gw running?)"
 	@echo ""
 	@echo "=== Multi-VLAN test complete ==="
 
 ## kind-demo: full end-to-end: create cluster, wire eth1 via containerlab, deploy everything.
+## kind-demo-2workers: a demo cluster with two workers, e.g. for live migration.
+## Only the workers are wired to the VLAN switch (port2, port4), the provider
+## network excludes the control plane, so VLAN pools select only the workers.
+## No Multus (only needed for the Multus comparison and the benchmark).
+TWO_WORKER_VARS = KIND_CONFIG=$(CURDIR)/demo/kind/kind-no-cni-2workers.yaml \
+	CONTAINERLAB_TOPOLOGY=$(CURDIR)/demo/containerlab/vlan-topology-2workers.yaml
+kind-demo-2workers:
+	$(MAKE) kind-create clab-deploy kind-deploy-kube-ovn kind-deploy-nic-prereqs \
+		kind-build-driver kind-deploy-driver kind-deploy-nic-example $(TWO_WORKER_VARS)
+	kubectl patch provider-network external --type merge \
+		-p '{"spec":{"excludeNodes":["$(KIND_CLUSTER_NAME)-control-plane"]}}'
+	@for i in $$(seq 1 30); do \
+	  r=$$(kubectl get provider-network external -o jsonpath='{.status.readyNodes}'); \
+	  echo "$$r" | grep -q control-plane || break; sleep 2; done; \
+	echo "provider network external ready on: $$r"
+
+## KubeVirt with the kube-ovn-nic binding as a KubeVirt Plugin (VEP-190, alpha):
+## a CEL hook adds the DRA NIC to the domain (deployments/kubevirt), so no binding
+## sidecar is needed. The driver must run with kubeletPlugin.annotateVMIMAC=true,
+## e.g. HELM_EXTRA_ARGS="--set kubeletPlugin.annotateVMIMAC=true".
+# The latest KubeVirt release; v1.10.0-beta.0 works too.
+KUBEVIRT_VERSION ?= v1.9.0
+CDI_VERSION      ?= v1.66.1
+KUBEVIRT_DIR     ?= $(CURDIR)/deployments/kubevirt
+KUBEVIRT_RELEASE  = https://github.com/kubevirt/kubevirt/releases/download/$(KUBEVIRT_VERSION)
+# deployments/kubevirt/plugin.yaml has the v1.9 form of the Plugin API. From v1.10
+# on the hook list is called launcherHooks and each hook names its hookPoint; the
+# CEL expression is the same.
+KUBEVIRT_PLUGIN_SED = $(if $(filter v1.9.%,$(KUBEVIRT_VERSION)),-e '',-e 's/^  domainHooks:/  launcherHooks:/' -e '/^    - cel:$$/a\        hookPoint: GuestDefinition')
+CDI_RELEASE       = https://github.com/kubevirt/containerized-data-importer/releases/download/$(CDI_VERSION)
+
+## kind-deploy-kubevirt: install KubeVirt, register the kube-ovn-nic binding
+## without a sidecar and apply the Plugin. Without /dev/kvm the VMs are emulated.
+.PHONY: kind-deploy-kubevirt
+kind-deploy-kubevirt:
+	@# the v1.10 CRDs are too large for the last-applied annotation of a client-side apply
+	kubectl apply --server-side --force-conflicts -f $(KUBEVIRT_RELEASE)/kubevirt-operator.yaml
+	kubectl wait --for=condition=Established crd/kubevirts.kubevirt.io --timeout=120s
+	kubectl apply -f $(KUBEVIRT_RELEASE)/kubevirt-cr.yaml
+	kubectl patch kubevirt kubevirt -n kubevirt --type merge --patch-file $(KUBEVIRT_DIR)/kubevirt-config.yaml
+	@[ -c /dev/kvm ] || kubectl patch kubevirt kubevirt -n kubevirt --type merge \
+		-p '{"spec":{"configuration":{"developerConfiguration":{"useEmulation":true}}}}'
+	kubectl wait --for=condition=Available -n kubevirt kv/kubevirt --timeout=600s
+	@# virt-operator installs the Plugin CRD once the Plugins feature gate is on
+	@for i in $$(seq 1 60); do kubectl get crd plugins.plugin.kubevirt.io >/dev/null 2>&1 && break; sleep 5; done
+	kubectl wait --for=condition=Established crd/plugins.plugin.kubevirt.io --timeout=120s
+	sed $(KUBEVIRT_PLUGIN_SED) $(KUBEVIRT_DIR)/plugin.yaml | kubectl apply -f -
+
+## kind-deploy-cdi: install CDI, for VMs with DataVolume disks.
+.PHONY: kind-deploy-cdi
+kind-deploy-cdi:
+	kubectl apply -f $(CDI_RELEASE)/cdi-operator.yaml
+	kubectl wait --for=condition=Established crd/cdis.cdi.kubevirt.io --timeout=120s
+	kubectl apply -f $(CDI_RELEASE)/cdi-cr.yaml
+	kubectl wait --for=condition=Available cdi/cdi --timeout=600s
+
+## kind-deploy-nfs: NFS-Ganesha as an in-cluster RWX provisioner, for VM disks
+## that must live-migrate. Use the storage class nfs4 (NFS 4.1): with the
+## chart's default nfs class (NFSv3), QEMU's image lock fails intermittently.
+.PHONY: kind-deploy-nfs
+kind-deploy-nfs:
+	$(HELM) repo add nfs-ganesha-server-and-external-provisioner https://kubernetes-sigs.github.io/nfs-ganesha-server-and-external-provisioner/ 2>/dev/null || true
+	$(HELM) upgrade --install nfs-ganesha nfs-ganesha-server-and-external-provisioner/nfs-server-provisioner \
+		-n nfs-ganesha --create-namespace \
+		--set persistence.enabled=true --set persistence.storageClass=standard --set persistence.size=15Gi \
+		--set storageClass.name=nfs --set storageClass.defaultClass=false \
+		--wait --timeout 300s
+	printf '%s\n' 'apiVersion: storage.k8s.io/v1' 'kind: StorageClass' 'metadata:' '  name: nfs4' \
+		'provisioner: cluster.local/nfs-ganesha-nfs-server-provisioner' 'reclaimPolicy: Delete' \
+		'volumeBindingMode: Immediate' 'allowVolumeExpansion: true' 'mountOptions:' '  - vers=4.1' | kubectl apply -f -
+
+## kind-delete-nfs: remove NFS-Ganesha. Delete the VMs and PVCs on nfs/nfs4
+## first: if the server goes before its clients, their mounts hang and the kind
+## nodes cannot be deleted anymore.
+.PHONY: kind-delete-nfs
+kind-delete-nfs:
+	@left=$$(kubectl get pvc -A -o jsonpath='{range .items[?(@.spec.storageClassName=="nfs4")]}{.metadata.namespace}/{.metadata.name} {end}{range .items[?(@.spec.storageClassName=="nfs")]}{.metadata.namespace}/{.metadata.name} {end}'); \
+	if [ -n "$$left" ]; then echo "PVCs still on NFS, delete them (and their VMs) first: $$left"; exit 1; fi
+	kubectl delete storageclass nfs4 --ignore-not-found
+	$(HELM) uninstall nfs-ganesha -n nfs-ganesha --wait || true
+	kubectl delete namespace nfs-ganesha --ignore-not-found --wait=true
+
 kind-demo: kind-create clab-deploy kind-deploy-kube-ovn kind-deploy-multus kind-deploy-nic-prereqs kind-build-driver kind-deploy-driver kind-deploy-nic-example
 	@echo ""
 	@echo "=== kube-ovn NIC DRA demo is running ==="
@@ -740,3 +834,7 @@ push-chart:
 	CHART_VERSION="$${CHART_GIT_TAG##chart/}" \
 		HELM=$(HELM) \
 		demo/scripts/push-driver-chart.sh
+
+## print-%: print a make variable, e.g. make -s print-KUBE_OVN_IMAGE (used by CI).
+print-%:
+	@echo '$($*)'

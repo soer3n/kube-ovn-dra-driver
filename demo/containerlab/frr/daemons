@@ -1,7 +1,7 @@
 # FRR daemon enablement for the nic-dra-demo gateway.
-# Only BGP is needed; everything else off to keep the container lean.
+# Only zebra is needed, for the gateway sub-interfaces; everything else off to keep the container lean.
 zebra=yes
-bgpd=yes
+bgpd=no
 ospfd=no
 ospf6d=no
 ripd=no
@@ -21,4 +21,3 @@ pathd=no
 
 vtysh_enable=yes
 zebra_options="  -A 127.0.0.1 -s 90000000"
-bgpd_options="   -A 127.0.0.1"
