@@ -2,10 +2,7 @@
 
 Measured with `make nic-bench-sweep` (`BENCH_REPS=10` for the final numbers below, `Makefile` extended this session to support repeated runs + median), kind cluster `nic-dra-demo` (1 control-plane + 1 worker), containerlab VLAN uplink, on a single bare-metal host (Intel NUC11TNKi5). All times are pod `create` → `Ready` wall-clock seconds. See `docs/benchmarking.md` for methodology and caveats.
 
-> These numbers were measured with an earlier design in which the driver
-> reserved the addresses itself by creating kube-ovn ip CRs. The current
-> design, in which kube-ovn-controller allocates from the claim, is measured in
-> [`benchmark-results-2026-10-06.md`](benchmark-results-2026-10-06.md).
+> These numbers were measured with an earlier design in which the driver reserved the addresses itself by creating kube-ovn ip CRs. The current design, in which kube-ovn-controller allocates from the claim, is measured in [`benchmark-results-2026-10-06.md`](benchmark-results-2026-10-06.md).
 
 Three arms:
 

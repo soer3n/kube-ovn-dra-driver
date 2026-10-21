@@ -1,8 +1,6 @@
 # Architecture: kube-ovn NIC DRA Driver
 
-This document describes the design of a Dynamic Resource Allocation (DRA) driver
-that bridges Kubernetes DRA (KEP-3063) with the kube-ovn CNI to provide
-scheduler-managed secondary network interfaces for pods.
+This document describes the design of a Dynamic Resource Allocation (DRA) driver that bridges Kubernetes DRA (KEP-3063) with the kube-ovn CNI to provide scheduler-managed secondary network interfaces for pods.
 
 It is intended as a reference implementation for the intersection of:
 - [kubernetes-sigs/multi-network-api](https://github.com/kubernetes-sigs/multi-network-api)
@@ -13,19 +11,13 @@ It is intended as a reference implementation for the intersection of:
 
 ## Problem Statement
 
-Kubernetes today has no first-class API for attaching a pod to a secondary network
-with scheduler-visible resource allocation. The existing solutions (Multus + NAD,
-kube-ovn annotations) work but share a common gap:
+Kubernetes today has no first-class API for attaching a pod to a secondary network with scheduler-visible resource allocation. The existing solutions (Multus + NAD, kube-ovn annotations) work but share a common gap:
 
-- **No scheduler visibility**: secondary NIC assignment happens in the CNI plugin,
-  after the pod is already scheduled. The scheduler cannot consider NIC availability.
+- **No scheduler visibility**: secondary NIC assignment happens in the CNI plugin, after the pod is already scheduled. The scheduler cannot consider NIC availability.
 - **No hotplug**: secondary NICs are wired at pod start, not dynamically after.
-- **No declarative request**: the network is requested through an annotation
-  and a NetworkAttachmentDefinition instead of a typed, schedulable resource.
+- **No declarative request**: the network is requested through an annotation and a NetworkAttachmentDefinition instead of a typed, schedulable resource.
 
-DRA solves the scheduler visibility and request problems. This driver shows how
-to back DRA ResourceSlices with real kube-ovn subnets, let kube-ovn allocate
-from the claims, and plumb the interfaces using NRI.
+DRA solves the scheduler visibility and request problems. This driver shows how to back DRA ResourceSlices with real kube-ovn subnets, let kube-ovn allocate from the claims, and plumb the interfaces using NRI.
 
 ---
 
@@ -38,15 +30,9 @@ The central constraint driving the architecture is:
 | **Phase 1** — resolve the allocation | `NodePrepareResources` (kubelet → driver gRPC) | Slow OK, but the pod netns does **not exist yet** |
 | **Phase 2** — plumbing | NRI `RunPodSandbox` hook | Pod netns **exists**, but the NRI request timeout is short (2 s by default) |
 
-The veth cannot be created in `NodePrepareResources`, because the pod network
-namespace does not exist yet. Waiting for kube-ovn-controller in
-`RunPodSandbox` would risk the NRI deadline. So phase 1 waits for the
-allocation and phase 2 only does local netlink and OVS work.
+The veth cannot be created in `NodePrepareResources`, because the pod network namespace does not exist yet. Waiting for kube-ovn-controller in `RunPodSandbox` would risk the NRI deadline. So phase 1 waits for the allocation and phase 2 only does local netlink and OVS work.
 
-Phase 1 does not allocate anything itself: kube-ovn-controller, started with
-`--enable-dra-nic`, allocates the address and creates the logical switch port
-as soon as the scheduler has bound the pod, the same way it does for a Multus
-attachment. The driver waits for the result.
+Phase 1 does not allocate anything itself: kube-ovn-controller, started with `--enable-dra-nic`, allocates the address and creates the logical switch port as soon as the scheduler has bound the pod, the same way it does for a Multus attachment. The driver waits for the result.
 
 ---
 
@@ -93,40 +79,25 @@ attachment. The driver waits for the result.
 
 ### `cmd/kube-ovn-dra-kubeletplugin/driver.go`
 
-Implements the kubelet plugin interface of
-`k8s.io/dynamic-resource-allocation/kubeletplugin`: publishes the
-ResourceSlices and forwards `PrepareResourceClaims` /
-`UnprepareResourceClaims` to the device state. It also starts the NRI plugin.
+Implements the kubelet plugin interface of `k8s.io/dynamic-resource-allocation/kubeletplugin`: publishes the ResourceSlices and forwards `PrepareResourceClaims` / `UnprepareResourceClaims` to the device state. It also starts the NRI plugin.
 
 ### `cmd/kube-ovn-dra-kubeletplugin/state.go`
 
-- **`NewDeviceState`** — takes the devices the NIC profile enumerated, the CDI
-  handler and the checkpoint manager.
-- **`Prepare`** — decodes the opaque `NicConfig`s (claim configs take
-  precedence over class configs), resolves every NIC of the claim
-  concurrently with `nicprepare.RequestIPAM`, adds one `plumbing.Spec` per NIC
-  to the `NICStore`, and writes the CDI spec and the checkpoint, which holds
-  the Specs too, so a restarted plugin restores the store. A repeated
-  call for a checkpointed claim returns the stored devices.
-- **`Unprepare`** — removes the claim's NICs from the store, the CDI spec and
-  the checkpoint entry. Nothing is released: kube-ovn-controller owns the
-  address and port.
+- **`NewDeviceState`** — takes the devices the NIC profile enumerated, the CDI handler and the checkpoint manager.
+- **`Prepare`** — decodes the opaque `NicConfig`s (claim configs take precedence over class configs), resolves every NIC of the claim concurrently with `nicprepare.RequestIPAM`, adds one `plumbing.Spec` per NIC to the `NICStore`, and writes the CDI spec and the checkpoint, which holds the Specs too, so a restarted plugin restores the store. A repeated call for a checkpointed claim returns the stored devices.
+- **`Unprepare`** — removes the claim's NICs from the store, the CDI spec and the checkpoint entry. Nothing is released: kube-ovn-controller owns the address and port.
 
 ### `cmd/kube-ovn-dra-kubeletplugin/nri.go`
 
-The NRI plugin (`dra-nic`, index `90`, so it runs after the primary CNI has set
-up `eth0`). It extracts the network namespace path from the sandbox and calls
-the `plumbing.SandboxHandler`. An attach failure fails the sandbox, so kubelet
-retries instead of running a pod with missing NICs.
+The NRI plugin (`dra-nic`, index `90`, so it runs after the primary CNI has set up `eth0`). It extracts the network namespace path from the sandbox and calls the `plumbing.SandboxHandler`. An attach failure fails the sandbox, so kubelet retries instead of running a pod with missing NICs.
+
+### `internal/publisher/` and `cmd/kube-ovn-dra-kubeletplugin/publisher.go`
+
+The central publisher (the chart default): a leader-elected Deployment running the same binary with the `publisher` subcommand. It watches Subnets, Vlans, ip objects and ResourceClaims, and publishes one pool per Subnet, named after the Subnet, available on all nodes for an overlay Subnet and on the nodes of the ProviderNetwork for a VLAN Subnet. Each device carries the Subnet's free addresses per family as consumable capacity (`capacity = free + held`, see [Publish modes](nic-driver.md#publish-modes)), so the scheduler refuses a pod when the pool is full. The kubelet plugins then publish nothing and only prepare claims.
 
 ### `internal/profiles/nic/`
 
-Lists kube-ovn `Subnet`s (and their `Vlan`s) and publishes each as a device;
-see the mapping below. `WatchDevices` watches both, and the plugin
-republishes the ResourceSlice after a change (debounced, only when the
-devices changed). `ApplyConfig` adds the CDI environment
-variables `KUBE_OVN_NIC_<INTERFACE>_SUBNET` and `KUBE_OVN_NIC_<INTERFACE>_DEVICE`,
-e.g. `KUBE_OVN_NIC_NET1_SUBNET=ovn-subnet`.
+Lists kube-ovn `Subnet`s (and their `Vlan`s) and publishes each as a device of the node's pool in node publish mode; in central mode the kubelet plugins still enumerate the devices to prepare claims, but publish nothing; see the mapping below. `WatchDevices` watches both, and the plugin republishes the ResourceSlice after a change (debounced, only when the devices changed). `ApplyConfig` adds the CDI environment variables `KUBE_OVN_NIC_<INTERFACE>_SUBNET` and `KUBE_OVN_NIC_<INTERFACE>_DEVICE`, e.g. `KUBE_OVN_NIC_NET1_SUBNET=ovn-subnet`.
 
 ### `pkg/nicprepare/` and `pkg/annotation/`
 
@@ -134,7 +105,8 @@ e.g. `KUBE_OVN_NIC_NET1_SUBNET=ovn-subnet`.
 RequestIPAM(ctx, client, claim, result, device, ifaceName) → NicDeviceConfig
   1. Resolve the pod from claim.Status.ReservedFor
   2. Read subnetName and provider from the device; reject the default provider
-  3. Wait (up to 30 s) for <provider>.<ifaceName>.kubernetes.io/allocated or
+  3. Wait (up to --allocation-timeout, default 30 s) for
+     <provider>.<ifaceName>.kubernetes.io/allocated or
      <provider>.kubernetes.io/allocated = "true" and read ip_address,
      mac_address, cidr, gateway and virtualmachine
   4. Port name = <pod or VM>.<namespace>.<provider key>; addresses in CIDR
@@ -143,14 +115,8 @@ RequestIPAM(ctx, client, claim, result, device, ifaceName) → NicDeviceConfig
 
 ### `pkg/plumbing/`
 
-- **`SandboxHandler`** — attaches the pod's NICs from the `NICStore` on
-  `RunPodSandbox` and, without rollback, on `Synchronize`; rolls
-  back on partial failure, records attached NICs and detaches them on
-  `StopPodSandbox`, followed by a sweep of all OVS ports owned by the pod.
-- **`ovsAttacher`** (`plumbing_linux.go`) — veth pair, move and rename into the
-  netns, MAC/MTU/addresses/routes, `ovs-vsctl add-port br-int` with
-  `external_ids`, and for KubeVirt pods the bridge, tap and DHCP server
-  (`dhcp.go`). `plumbing_nolinux.go` keeps the package cross-compilable.
+- **`SandboxHandler`** — attaches the pod's NICs from the `NICStore` on `RunPodSandbox` and, without rollback, on `Synchronize`; rolls back on partial failure, records attached NICs and detaches them on `StopPodSandbox`, followed by a sweep of all OVS ports owned by the pod.
+- **`ovsAttacher`** (`plumbing_linux.go`) — veth pair, move and rename into the netns, MAC/MTU/addresses/routes, `ovs-vsctl add-port br-int` with `external_ids`, and for KubeVirt pods the bridge, tap and DHCP server (`dhcp.go`). `plumbing_nolinux.go` keeps the package cross-compilable.
 
 ---
 
@@ -175,14 +141,15 @@ spec:
 name: subnet-ovn-subnet
 allowMultipleAllocations: true
 attributes:
-  nic.kubeovn.io/subnetName:  "ovn-subnet"
-  nic.kubeovn.io/subnetType:  "ovn"
-  nic.kubeovn.io/provider:    "ovn-subnet.default.ovn"
-  nic.kubeovn.io/vpc:         "ovn-cluster"
+  subnetName:  "ovn-subnet"
+  subnetType:  "ovn"
+  provider:    "ovn-subnet.default.ovn"
+  vpc:         "ovn-cluster"
 ```
 
-VLAN subnets also get `subnetType: "vlan"`, `vlanId` and `providerNetwork`
-from their `Vlan`. kube-ovn-controller only needs `subnetName`.
+The attributes carry no domain, so DRA qualifies them with the driver name: a selector reads them as `device.attributes['nic.kubeovn.io'].subnetName`, or under the configured name for a custom `driverName`. A Subnet name that is not a valid device name (a DNS label of at most 63 characters, e.g. one with a dot) gets a shortened name with a hash suffix. Subnets with the default provider, a non-OVN provider or no CIDR are not published, and a VLAN Subnet is only published where its ProviderNetwork is ready.
+
+VLAN subnets also get `subnetType: "vlan"`, `vlanId` and `providerNetwork` from their `Vlan`. kube-ovn-controller only needs `subnetName`.
 
 Users select devices via CEL in their `ResourceClaim`:
 
@@ -201,16 +168,11 @@ requests:
 
 ## IPAM Model: Flat, CNI-Owned
 
-The driver does **not** split subnets per node. The kube-ovn OVN logical switch
-spans all nodes — any pod on any node can receive any IP from the subnet's CIDR.
-The scheduler selects a node; kube-ovn-controller then allocates an IP from the
-flat pool once the pod is bound.
+The driver does **not** split subnets per node. The kube-ovn OVN logical switch spans all nodes — any pod on any node can receive any IP from the subnet's CIDR. The scheduler selects a node; kube-ovn-controller then allocates an IP from the flat pool once the pod is bound.
 
-This is the **flat multi-network model**: one `/24` across all nodes, no sub-CIDR
-allocation per node. The OVN fabric handles inter-node forwarding transparently.
+This is the **flat multi-network model**: one `/24` across all nodes, no sub-CIDR allocation per node. The OVN fabric handles inter-node forwarding transparently.
 
-This contrasts with the default Kubernetes pod CIDR model where each node owns a
-sub-CIDR (e.g. `/27` per node from a `/16` cluster CIDR).
+This contrasts with the default Kubernetes pod CIDR model where each node owns a sub-CIDR (e.g. `/27` per node from a `/16` cluster CIDR).
 
 ```
 Flat model (this driver):
@@ -227,31 +189,20 @@ Sub-CIDR model (default NodeIpam):
 
 ## NRI Integration
 
-NRI (Node Resource Interface) is the containerd plugin API used to intercept
-container lifecycle events. The driver registers as an NRI plugin that handles:
+NRI (Node Resource Interface) is the containerd plugin API used to intercept container lifecycle events. The driver registers as an NRI plugin that handles:
 
-- **`Synchronize`** — called on every (re)connect with all existing sandboxes;
-  attaches missing NICs of running pods.
-- **`RunPodSandbox`** — the sandbox network namespace exists and its path is
-  in the event. Phase 2 plumbing.
+- **`Synchronize`** — called on every (re)connect with all existing sandboxes; attaches missing NICs of running pods.
+- **`RunPodSandbox`** — the sandbox network namespace exists and its path is in the event. Phase 2 plumbing.
 - **`StopPodSandbox`** — the sandbox stops. Triggers the detach.
 
-NRI is enabled by default in containerd 2.x. The plugin registers as
-`dra-nic` with index `90`. The NRI socket directory `/var/run/nri` and the
-host netns directory are mounted into the plugin pod; the netns mount uses
-`HostToContainer` propagation, because the runtime creates the netns files
-after the plugin has started.
+NRI is enabled by default in containerd 2.x. The plugin registers as `dra-nic` with index `90`. The NRI socket directory `/var/run/nri` and the host netns directory are mounted into the plugin pod; the netns mount uses `HostToContainer` propagation, because the runtime creates the netns files after the plugin has started.
 
 ---
 
 ## What This Driver Does NOT Do
 
 - **No IPAM of its own**: kube-ovn-controller allocates and releases.
-- **No IP pool accounting in the scheduler**: subnet devices allow multiple
-  allocations without a capacity, so the scheduler does not see pool
-  exhaustion. Consumable capacity could change that (see below).
-- **No NetworkPolicy or Services on secondary interfaces**: out of scope,
-  tracked by `multi-network-api`.
+- **No NetworkPolicy or Services on secondary interfaces**: out of scope, tracked by `multi-network-api`.
 - **No hot-plug**: NICs are attached when the sandbox starts.
 
 ---
@@ -260,14 +211,11 @@ after the plugin has started.
 
 ### kubernetes-sigs/multi-network-api
 
-`multi-network-api` defines the `Network` CRD (identity layer) and explicitly
-defers interface attachment to DRA:
+`multi-network-api` defines the `Network` CRD (identity layer) and explicitly defers interface attachment to DRA:
 
-> *"We do not list basic use cases that just add network interfaces to a pod,
-> since those are currently handled by Dynamic Resource Allocation."*
+> *"We do not list basic use cases that just add network interfaces to a pod, since those are currently handled by Dynamic Resource Allocation."*
 
-This driver implements exactly that DRA-based attachment layer. A future
-integration would:
+This driver implements exactly that DRA-based attachment layer. A future integration would:
 1. Watch `Network` objects
 2. Map each `Network` to a kube-ovn `Subnet`
 3. Publish the subnet as a `ResourceSlice` device
@@ -275,18 +223,15 @@ integration would:
 
 ### Consumable capacity / partitionable devices
 
-Today any number of claims can take the same subnet device. With consumable
-capacity (or KEP-4815 partitionable devices), the IP pool itself would become a
-finite device capacity:
+The central publisher (the default) uses consumable capacity: the IP pool of a Subnet is a finite device capacity, and each claim consumes one address per family:
 
 ```
 ResourceSlice device: subnet-ovn-subnet
-  pool capacity: 254 IPs
-  partition shape: 1 IP per claim
+  capacity ipv4: 254 (free + held)
+  request policy: 1 per claim
 ```
 
-The scheduler would track pool exhaustion and refuse to schedule pods when the
-subnet is full — something the current driver cannot express.
+The scheduler tracks pool exhaustion and refuses to schedule a pod when the Subnet is full. In node publish mode the devices only allow multiple allocations, without capacity.
 
 ---
 
@@ -294,11 +239,9 @@ subnet is full — something the current driver cannot express.
 
 The full demo uses:
 
-- **kind** (v1.35+) — local multi-node cluster, no default CNI
-- **Containerlab** — injects `eth1` into kind node containers to simulate
-  a VLAN-capable physical NIC for kube-ovn ProviderNetwork, plus an FRR gateway
-- **kube-ovn** with `--enable-dra-nic` — installed via Helm from the
-  `KUBE_OVN_VERSION` branch, provides OVN overlay + VLAN subnets
+- **kind** (v0.33.0, Kubernetes 1.36 node image) — local multi-node cluster, no default CNI
+- **Containerlab** — injects `eth1` into kind node containers to simulate a VLAN-capable physical NIC for kube-ovn ProviderNetwork, plus an FRR gateway
+- **kube-ovn** with `--enable-dra-nic` — installed via Helm from the `KUBE_OVN_VERSION` branch, provides OVN overlay + VLAN subnets
 - **This driver** — DRA kubelet plugin + NRI plugin
 - **Multus** (optional) — only for the DRA vs Multus benchmark
 
@@ -307,6 +250,4 @@ make kind-demo          # full end-to-end setup
 make kind-delete        # teardown
 ```
 
-See [`nic-driver.md`](nic-driver.md),
-[`demo/kind/kind-no-cni.yaml`](../demo/kind/kind-no-cni.yaml) and
-[`demo/containerlab/vlan-topology.yaml`](../demo/containerlab/vlan-topology.yaml).
+See [`nic-driver.md`](nic-driver.md), [`demo/kind/kind-no-cni.yaml`](../demo/kind/kind-no-cni.yaml) and [`demo/containerlab/vlan-topology.yaml`](../demo/containerlab/vlan-topology.yaml).
