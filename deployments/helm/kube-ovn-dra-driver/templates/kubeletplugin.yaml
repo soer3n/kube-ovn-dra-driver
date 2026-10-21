@@ -78,6 +78,11 @@ spec:
             service: liveness
           failureThreshold: 3
           periodSeconds: 10
+        readinessProbe:
+          grpc:
+            port: {{ .Values.kubeletPlugin.containers.plugin.healthcheckPort }}
+            service: readiness
+          periodSeconds: 5
         {{- end }}
         env:
         - name: DRIVER_NAME
@@ -96,6 +101,10 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        {{- if .Values.kubeletPlugin.annotateVMIMAC }}
+        - name: ANNOTATE_VMI_MAC
+          value: "true"
+        {{- end }}
         - name: NAMESPACE
           valueFrom:
             fieldRef:

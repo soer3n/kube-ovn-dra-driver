@@ -10,7 +10,7 @@ rules:
   verbs: ["get"]
 - apiGroups: [""]
   resources: ["nodes"]
-  verbs: ["get"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "watch"]
@@ -26,3 +26,8 @@ rules:
 - apiGroups: ["kubeovn.io"]
   resources: ["vlans", "provider-networks"]
   verbs: ["get", "list", "watch"]
+{{- if .Values.kubeletPlugin.annotateVMIMAC }}
+- apiGroups: ["kubevirt.io"]
+  resources: ["virtualmachineinstances"]
+  verbs: ["patch"]
+{{- end }}

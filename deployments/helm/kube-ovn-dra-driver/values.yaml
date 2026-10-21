@@ -64,6 +64,10 @@ kubeletPlugin:
     # cni-<id>). Mounted with HostToContainer propagation so the NRI hook can
     # open the pod netns by path.
     netnsDir: /var/run/netns
+  # Experimental: record the MAC of a KubeVirt VM's NIC on its VMI
+  # (nic.kubeovn.io/mac.<interface>), for a KubeVirt Plugin CEL hook that adds
+  # the NIC to the domain instead of the binding sidecar. Needs RBAC to patch VMIs.
+  annotateVMIMAC: false
   containers:
     init:
       securityContext: {}
@@ -74,7 +78,7 @@ kubeletPlugin:
       # Set to a negative value to disable the service and the probe.
       healthcheckPort: 51515
 
-# publisher switches the driver to the central publish mode. One leader-elected
+# publisher switches the driver to the central publish mode (the default). One leader-elected
 # publisher then publishes every kube-ovn Subnet as its own cluster-wide pool,
 # named after the Subnet: available on all nodes for an overlay Subnet, and on the
 # nodes where the ProviderNetwork is ready for a VLAN underlay Subnet, so the
@@ -83,14 +87,14 @@ kubeletPlugin:
 # when the pool is exhausted. The kubelet plugins then publish nothing and only
 # prepare claims.
 #
-# Without the publisher (the default) every kubelet plugin publishes a pool for
-# its node, with all Subnets and no capacity.
+# Without the publisher (node publish mode) every kubelet plugin publishes a pool
+# for its node, with the Subnets it can serve and no capacity.
 #
 # Needs the DRAConsumableCapacity feature gate for capacity and for sharing a
 # Subnet between pods: alpha in Kubernetes 1.34 and 1.35, beta and on by default
 # from 1.36.
 publisher:
-  enabled: false
+  enabled: true
   # More replicas only speed up the takeover when the leader goes away.
   replicas: 2
   # Publish the free addresses of a Subnet as consumable capacity.

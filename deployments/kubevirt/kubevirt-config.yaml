@@ -1,0 +1,17 @@
+# Registers the kube-ovn-nic binding without a sidecar image, so KubeVirt core
+# skips the interface and injects no sidecar, and enables DRA networks and the
+# Plugins feature gate for plugin.yaml. Prototype: Plugins is alpha.
+apiVersion: kubevirt.io/v1
+kind: KubeVirt
+metadata:
+  name: kubevirt
+  namespace: kubevirt
+spec:
+  configuration:
+    developerConfiguration:
+      featureGates:
+        - NetworkDevicesWithDRA
+        - Plugins
+    network:
+      binding:
+        kube-ovn-nic: {}

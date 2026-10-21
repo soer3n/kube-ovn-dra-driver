@@ -1,0 +1,41 @@
+# Adds the kube-ovn DRA NIC to the domain with a KubeVirt Plugin (VEP-190,
+# feature gate Plugins, alpha) instead of a binding sidecar. Prototype.
+#
+# This is the form of KubeVirt v1.9, the latest release (domainHooks). From v1.10
+# on the list is called launcherHooks and each hook names its hookPoint;
+# make kind-deploy-kubevirt converts it for KUBEVIRT_VERSION=v1.10 and later, by hand:
+#   sed -e 's/^  domainHooks:/  launcherHooks:/' -e '/^    - cel:$/a\        hookPoint: GuestDefinition' plugin.yaml
+#
+# For every VMI interface with the kube-ovn-nic binding, the CEL hook appends an
+# ethernet interface to the domain:
+#   - target: the interface name. The driver names the tap after the claim
+#     config's interfaceName, so that must equal the VMI interface (= network)
+#     name, at most 15 characters.
+#   - MAC: the VMI annotation nic.kubeovn.io/mac.<interface>, which the driver
+#     writes when it prepares the claim (kubeletPlugin.annotateVMIMAC=true).
+#     Without it the expression fails and so does the domain definition.
+# KubeVirt core skips the interface since it has a binding, and the binding has
+# no sidecarImage, so no sidecar is injected (kubevirt-config.yaml).
+# CEL lists replace the domain's list, so the hook appends to the existing one.
+apiVersion: plugin.kubevirt.io/v1alpha1
+kind: Plugin
+metadata:
+  name: kube-ovn-nic
+spec:
+  condition: >-
+    vmi.Spec.Domain.Devices.Interfaces.exists(i, has(i.Binding) && i.Binding.Name == "kube-ovn-nic")
+  failureStrategy: Fail
+  domainHooks:
+    - cel:
+        expression: >-
+          Domain{Devices: DomainDeviceList{Interfaces: domainSpec.Devices.Interfaces +
+            vmi.Spec.Domain.Devices.Interfaces.filter(i,
+              has(i.Binding) && i.Binding.Name == "kube-ovn-nic" &&
+              !domainSpec.Devices.Interfaces.exists(d, has(d.Alias) && d.Alias.Name == "ua-" + i.Name)
+            ).map(i, DomainInterface{
+              Alias: DomainAlias{Name: "ua-" + i.Name},
+              MAC: DomainInterfaceMAC{Address: vmi.Annotations["nic.kubeovn.io/mac." + i.Name]},
+              Model: DomainInterfaceModel{Type: i.Model == "" ? "virtio" : i.Model},
+              Source: DomainInterfaceSource{Ethernet: DomainInterfaceSourceEthernet{}},
+              Target: DomainInterfaceTarget{Dev: i.Name, Managed: "no"}
+            })}}
