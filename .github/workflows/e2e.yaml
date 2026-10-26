@@ -101,6 +101,16 @@ jobs:
       run: make setup-e2e KUBE_OVN_VERSION="$KUBE_OVN_REF"
     - name: Run e2e tests
       run: make test-e2e
+    - name: Dump the cluster state
+      if: failure()
+      run: |
+        df -h / /var/lib/docker || true
+        free -m || true
+        kubectl get nodes -o wide || true
+        kubectl describe nodes | grep -A8 -E '^(Conditions|Taints|Allocated resources):' || true
+        kubectl get pods -A -o wide || true
+        kubectl get kubevirt -n kubevirt -o yaml || true
+        kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
     - name: Teardown e2e
       if: always()
       # also destroys the containerlab fabric when E2E_CONTAINERLAB=1 and NFS
