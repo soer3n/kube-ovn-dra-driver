@@ -1,8 +1,8 @@
 # kube-ovn NIC DRA Driver
 
-A [Dynamic Resource Allocation (DRA)](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/) driver for **kube-ovn virtual NICs**. It publishes each kube-ovn `Subnet` as a DRA device, so a workload can request a secondary network interface (`net1`, `net2`, …) through a `ResourceClaim` instead of a Multus annotation.
+> Based on [`kubernetes-sigs/dra-example-driver`](https://github.com/kubernetes-sigs/dra-example-driver): this repository started as a fork of it, keeps its history, and was rewritten around a single `nic` device profile. Files that carry both a Kubernetes Authors and a soer3n copyright line were modified from it.
 
-> Forked from [`kubernetes-sigs/dra-example-driver`](https://github.com/kubernetes-sigs/dra-example-driver) and rewritten around a single `nic` device profile.
+A [Dynamic Resource Allocation (DRA)](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/) driver for **kube-ovn virtual NICs**. It publishes each kube-ovn `Subnet` as a DRA device, so a workload can request a secondary network interface (`net1`, `net2`, …) through a `ResourceClaim` instead of a Multus annotation.
 
 > 📖 **New here?** Jump to [Documentation](#documentation) for a map of the design docs and the "is this the right approach?" decision aids before diving in.
 
