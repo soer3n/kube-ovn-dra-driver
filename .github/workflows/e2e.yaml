@@ -111,6 +111,14 @@ jobs:
         kubectl get pods -A -o wide || true
         kubectl get kubevirt -n kubevirt -o yaml || true
         kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
+    - name: Debug over SSH
+      # debug branch only: on a failed KubeVirt job, wait for an SSH session (tmate) before the teardown;
+      # only the SSH keys of the GitHub account that started the run can connect. `touch continue` ends it.
+      if: failure() && startsWith(matrix.variant, 'kubevirt')
+      uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113 # v3.24
+      with:
+        limit-access-to-actor: true
+      timeout-minutes: 60
     - name: Teardown e2e
       if: always()
       # also destroys the containerlab fabric when E2E_CONTAINERLAB=1 and NFS
