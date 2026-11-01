@@ -104,12 +104,20 @@ jobs:
     - name: Dump the cluster state
       if: failure()
       run: |
+        uname -a || true
         df -h / /var/lib/docker || true
         free -m || true
+        ls -l /dev/kvm || true
+        stat -fc %T /sys/fs/cgroup || true
         kubectl get nodes -o wide || true
         kubectl describe nodes | grep -A8 -E '^(Conditions|Taints|Allocated resources):' || true
         kubectl get pods -A -o wide || true
         kubectl get kubevirt -n kubevirt -o yaml || true
+        for p in $(kubectl get pods -n kubevirt -l kubevirt.io=virt-handler -o name 2>/dev/null); do
+          echo "== $p"
+          kubectl describe -n kubevirt "$p" | sed -n '/^Containers:/,/^Conditions:/p' || true
+          kubectl logs -n kubevirt "$p" -c virt-handler --previous --tail=80 || true
+        done
         kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
     - name: Debug over SSH
       # debug branch only: on a failed KubeVirt job, wait for an SSH session (tmate) before the teardown;
