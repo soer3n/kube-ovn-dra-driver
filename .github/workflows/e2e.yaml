@@ -119,6 +119,11 @@ jobs:
           kubectl logs -n kubevirt "$p" -c virt-handler --previous --tail=80 || true
         done
         kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
+    - name: Move the runner's SSH key aside
+      # ubuntu-26.04 runners ship ~/.ssh/id_rsa, and tmate's ssh-keygen would wait at its overwrite prompt
+      if: failure() && startsWith(matrix.variant, 'kubevirt')
+      run: |
+        for f in ~/.ssh/id_rsa ~/.ssh/id_rsa.pub; do [ -e "$f" ] && mv "$f" "$f.orig"; done; true
     - name: Debug over SSH
       # debug branch only: on a failed KubeVirt job, wait for an SSH session (tmate) before the teardown;
       # only the SSH keys of the GitHub account that started the run can connect. `touch continue` ends it.
