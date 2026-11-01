@@ -68,6 +68,10 @@ jobs:
         repository: soer3n/kube-ovn
         ref: ${{ env.KUBE_OVN_REF }}
         path: kube-ovn
+    - name: Raise the inotify limits
+      # The kind nodes share the runner's per-user inotify limits; with the default of 128 instances
+      # virt-handler exits with "Failed to create an inotify watcher: too many open files".
+      run: sudo sysctl -w fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=1048576
     - name: Enable KVM
       if: env.E2E_KUBEVIRT == '1'
       run: |
