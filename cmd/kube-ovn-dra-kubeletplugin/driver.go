@@ -80,6 +80,12 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 	publish := helper.PublishResources
 	if config.flags.publishMode == publishModeCentral {
 		klog.FromContext(ctx).Info("Central publish mode: the publisher publishes the devices, this plugin only prepares claims")
+		// Publishing nothing removes this node's slices from before a switch from
+		// node mode. Their owner, the Node, stays, so nothing else removes them, and
+		// the scheduler would allocate from them without the capacity of the Subnet.
+		if err := publish(ctx, resourceslice.DriverResources{}); err != nil {
+			return nil, err
+		}
 		publish = func(context.Context, resourceslice.DriverResources) error { return nil }
 	} else if err := publish(ctx, state.driverResources); err != nil {
 		return nil, err

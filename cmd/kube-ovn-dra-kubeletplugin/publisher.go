@@ -69,12 +69,12 @@ type publisherFlags struct {
 	kubeClientConfig flags.KubeClientConfig
 	loggingConfig    *flags.LoggingConfig
 
-	driverName      string
-	namespace       string
-	leaseName       string
-	identity        string
-	ownerDeployment string
-	capacity        bool
+	driverName       string
+	namespace        string
+	leaseName        string
+	identity         string
+	ownerClusterRole string
+	capacity         bool
 }
 
 func newPublisherApp() *cli.App {
@@ -89,7 +89,7 @@ func newPublisherApp() *cli.App {
 		},
 		&cli.StringFlag{
 			Name:        "namespace",
-			Usage:       "Namespace of the publisher, where the lease and the owner Deployment are.",
+			Usage:       "Namespace of the publisher, where the lease is.",
 			Required:    true,
 			Destination: &f.namespace,
 			EnvVars:     []string{"NAMESPACE"},
@@ -109,11 +109,11 @@ func newPublisherApp() *cli.App {
 			EnvVars:     []string{"POD_NAME"},
 		},
 		&cli.StringFlag{
-			Name:        "owner-deployment",
-			Usage:       "Name of the Deployment that owns the published ResourceSlices, so they are removed with it.",
+			Name:        "owner-cluster-role",
+			Usage:       "Name of the ClusterRole of the publisher, which owns the published ResourceSlices, so they are removed with it.",
 			Required:    true,
-			Destination: &f.ownerDeployment,
-			EnvVars:     []string{"OWNER_DEPLOYMENT"},
+			Destination: &f.ownerClusterRole,
+			EnvVars:     []string{"OWNER_CLUSTER_ROLE"},
 		},
 		&cli.BoolFlag{
 			Name:        "capacity",
@@ -201,7 +201,7 @@ func runPublisher(ctx context.Context, f *publisherFlags, clientSets flags.Clien
 func publish(ctx context.Context, f *publisherFlags, clientSets flags.ClientSets) error {
 	logger := klog.FromContext(ctx)
 
-	owner, err := ownerOf(ctx, clientSets.Core, f.namespace, f.ownerDeployment)
+	owner, err := ownerOf(ctx, clientSets.Core, f.ownerClusterRole)
 	if err != nil {
 		return err
 	}
@@ -279,18 +279,20 @@ func publish(ctx context.Context, f *publisherFlags, clientSets flags.ClientSets
 	return nil
 }
 
-// ownerOf returns the Deployment that owns the ResourceSlices: they are removed
-// with it, for example by a Helm uninstall.
-func ownerOf(ctx context.Context, client kubernetes.Interface, namespace, name string) (*resourceslice.Owner, error) {
-	deployment, err := client.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+// ownerOf returns the ClusterRole that owns the ResourceSlices: they are removed
+// with it, by a Helm uninstall or when the chart disables the publisher. A
+// ResourceSlice is cluster-scoped, and the garbage collector ignores a namespaced
+// owner of a cluster-scoped object.
+func ownerOf(ctx context.Context, client kubernetes.Interface, name string) (*resourceslice.Owner, error) {
+	role, err := client.RbacV1().ClusterRoles().Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("get owner Deployment %s/%s: %w", namespace, name, err)
+		return nil, fmt.Errorf("get owner ClusterRole %s: %w", name, err)
 	}
 	return &resourceslice.Owner{
-		APIVersion: "apps/v1",
-		Kind:       "Deployment",
-		Name:       deployment.Name,
-		UID:        deployment.UID,
+		APIVersion: "rbac.authorization.k8s.io/v1",
+		Kind:       "ClusterRole",
+		Name:       role.Name,
+		UID:        role.UID,
 	}, nil
 }
 

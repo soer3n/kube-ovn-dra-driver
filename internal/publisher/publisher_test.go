@@ -159,6 +159,18 @@ func TestDeviceOverlayHasNoVlanAttributes(t *testing.T) {
 	assert.NotContains(t, d.Attributes, AttrProviderNetwork)
 }
 
+// A value the API rejects would invalidate the whole ResourceSlice, in node
+// publish mode with the devices of all Subnets.
+func TestDeviceLeavesOutTooLongAttributes(t *testing.T) {
+	limit := strings.Repeat("a", resourceapi.DeviceAttributeMaxValueLength)
+	d := Device(Subnet{Name: testVlanSubnet, Provider: limit + "a", ProviderNetwork: limit + "a", VPC: limit}, false)
+
+	assert.NotContains(t, d.Attributes, AttrProvider)
+	assert.NotContains(t, d.Attributes, AttrProviderNetwork)
+	assert.Equal(t, limit, *d.Attributes[AttrVPC].StringValue)
+	assert.Equal(t, testVlanSubnet, *d.Attributes[AttrSubnetName].StringValue)
+}
+
 func TestDeviceCapacityPerFamily(t *testing.T) {
 	d := Device(Subnet{
 		Name: testDualSubnet,
@@ -205,6 +217,34 @@ func TestPoolScope(t *testing.T) {
 	assert.Equal(t, []string{"true"}, exprs[0].Values)
 }
 
+// The API refuses a device with a capacity of 0, so a Subnet without a free
+// address publishes its pool without the device.
+func TestPoolWithoutFreeAddress(t *testing.T) {
+	free := Family{Enabled: true, Free: 1}
+	none := Family{Enabled: true}
+	held := Family{Enabled: true, Held: 1}
+	tests := []struct {
+		name         string
+		subnet       Subnet
+		withCapacity bool
+		wantDevices  int
+	}{
+		{"free address", Subnet{Name: testSubnetA, V4: free}, true, 1},
+		{"address held by a claim", Subnet{Name: testSubnetA, V4: held}, true, 1},
+		{"no address", Subnet{Name: testSubnetA, V4: none}, true, 0},
+		{"one family without an address", Subnet{Name: testSubnetA, V4: free, V6: none}, true, 0},
+		{"family that is not enabled", Subnet{Name: testSubnetA, V4: free, V6: Family{}}, true, 1},
+		{"no capacity published", Subnet{Name: testSubnetA, V4: none}, false, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool := Pool(tt.subnet, tt.withCapacity)
+			require.Len(t, pool.Slices, 1)
+			assert.Len(t, pool.Slices[0].Devices, tt.wantDevices)
+		})
+	}
+}
+
 func TestPoolsAreNamedAfterTheSubnet(t *testing.T) {
 	pools := Pools([]Subnet{{Name: testSubnetA}, {Name: testSubnetB, VlanID: 7, ProviderNetwork: testPN}}, true)
 	require.Len(t, pools, 2)
@@ -248,6 +288,8 @@ func TestPublishable(t *testing.T) {
 		{"explicit default provider", Subnet{Name: testSubnetA, Provider: defaultProvider, V4: v4}, errDefaultProvider},
 		{"non-ovn provider", Subnet{Name: testSubnetA, Provider: "macvlan.ns", V4: v4}, "non-OVN provider"},
 		{"no address family", Subnet{Name: testSubnetA, Provider: testProviderA}, "no IPv4 or IPv6 CIDR"},
+		{"name at the attribute limit", Subnet{Name: strings.Repeat("a", resourceapi.DeviceAttributeMaxValueLength), Provider: testProviderA, V4: v4}, ""},
+		{"name over the attribute limit", Subnet{Name: strings.Repeat("a", resourceapi.DeviceAttributeMaxValueLength+1), Provider: testProviderA, V4: v4}, "longer than"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

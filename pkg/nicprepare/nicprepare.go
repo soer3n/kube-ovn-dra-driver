@@ -286,6 +286,12 @@ func lookupPodForClaim(ctx context.Context, client coreclientset.Interface, clai
 		if getErr != nil {
 			return "", "", "", fmt.Errorf("get pod %s/%s: %w", podNS, ref.Name, getErr)
 		}
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			// A consumer that finished, e.g. a migration's source pod on the node the VM
+			// migrates back to. kube-controller-manager keeps adding it to ReservedFor
+			// of a claim that is still in use, because it does not check the pod's phase.
+			continue
+		}
 		consumers = append(consumers, pod)
 		if pod.Spec.NodeName == nodeName {
 			onNode = append(onNode, pod)

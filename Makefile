@@ -704,7 +704,7 @@ kind-demo-2workers:
 ## a CEL hook adds the DRA NIC to the domain (deployments/kubevirt), so no binding
 ## sidecar is needed. The driver must run with kubeletPlugin.annotateVMIMAC=true,
 ## e.g. HELM_EXTRA_ARGS="--set kubeletPlugin.annotateVMIMAC=true".
-# The latest KubeVirt release; v1.10.0-beta.0 works too.
+# The latest KubeVirt release; v1.10.0-rc.0 works too.
 KUBEVIRT_VERSION ?= v1.9.0
 CDI_VERSION      ?= v1.66.1
 KUBEVIRT_DIR     ?= $(CURDIR)/deployments/kubevirt

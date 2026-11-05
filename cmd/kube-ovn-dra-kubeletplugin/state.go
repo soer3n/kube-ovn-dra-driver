@@ -374,8 +374,8 @@ func (s *DeviceState) resultsByConfig(claim *resourceapi.ResourceClaim) (map[run
 		if result.Driver != s.driverName {
 			continue
 		}
-		if _, exists := s.allocatable[result.Device]; !exists {
-			return nil, fmt.Errorf("requested device is not allocatable: %v", result.Device)
+		if err := s.checkAllocatable(result.Device); err != nil {
+			return nil, err
 		}
 		for _, c := range slices.Backward(configs) {
 			if configMatchesRequest(c.Requests, result.Request) {
@@ -460,6 +460,27 @@ func allocatableDevices(resources resourceslice.DriverResources, nodeName string
 		}
 	}
 	return allocatable
+}
+
+// checkAllocatable reports an error for a device this plugin does not know. The
+// plugin learns about a new subnet a moment after the publisher, which watches it
+// too, and a claim can be allocated in between. A failed prepare can take kubelet
+// more than a minute to retry, so the devices are enumerated once more first. It
+// only updates the list prepare checks: driverResources stays as it is, so the
+// refresh loop still sees the change and publishes it.
+func (s *DeviceState) checkAllocatable(device string) error {
+	if _, exists := s.allocatable[device]; exists {
+		return nil
+	}
+	resources, err := s.profile.EnumerateDevices()
+	if err != nil {
+		return fmt.Errorf("enumerate devices: %w", err)
+	}
+	s.allocatable = allocatableDevices(resources, s.nodeName)
+	if _, exists := s.allocatable[device]; !exists {
+		return fmt.Errorf("requested device is not allocatable: %v", device)
+	}
+	return nil
 }
 
 // RefreshDevices enumerates the devices again, e.g. after a subnet was added,

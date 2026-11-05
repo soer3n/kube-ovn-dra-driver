@@ -63,6 +63,9 @@ const (
 	testPortNet2      = testPort + "." + testIface2
 	testClaimUID2     = "claim-uid-2"
 	testOtherDevice   = "subnet-red"
+	testRedSubnet     = "red"
+	testRedProvider   = "red.default.ovn"
+	testUnknownDevice = "subnet-unknown"
 	testOtherDriver   = "gpu.example.com"
 	testOtherRequest  = "other"
 	testParentRequest = "network"
@@ -489,6 +492,26 @@ func TestRefreshDevices(t *testing.T) {
 	assert.True(t, changed)
 	assert.Len(t, resources.Pools[testNode].Slices[0].Devices, 2)
 	assert.Contains(t, state.allocatable, testOtherDevice, "a claim for the new subnet must be allocatable")
+}
+
+// A claim can be allocated from a new subnet before the refresh loop has seen it.
+// Prepare finds the device, and the refresh loop still publishes the change.
+func TestCheckAllocatableFindsNewSubnet(t *testing.T) {
+	config, client := newTestConfigWithClient(t)
+	state, err := NewDeviceState(config)
+	require.NoError(t, err)
+
+	assert.ErrorContains(t, state.checkAllocatable(testOtherDevice), "not allocatable")
+
+	_, err = client.Resource(testSubnetGVR).Create(context.Background(), testSubnet(testRedSubnet, testRedProvider), metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	require.NoError(t, state.checkAllocatable(testOtherDevice))
+	assert.ErrorContains(t, state.checkAllocatable(testUnknownDevice), "not allocatable")
+
+	_, changed, err := state.RefreshDevices()
+	require.NoError(t, err)
+	assert.True(t, changed, "the refresh loop must still publish the new subnet")
 }
 
 // A config naming a firstAvailable request applies to the subrequest the

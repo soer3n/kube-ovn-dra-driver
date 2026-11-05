@@ -42,6 +42,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 )
 
@@ -159,6 +160,9 @@ func (s Subnet) Publishable() error {
 		return fmt.Errorf("subnet %q uses the non-OVN provider %q, which the DRA NIC driver does not support", s.Name, s.Provider)
 	case !s.V4.Enabled && !s.V6.Enabled:
 		return fmt.Errorf("subnet %q has no IPv4 or IPv6 CIDR; a DRA NIC needs an address", s.Name)
+	case len(s.Name) > resourceapi.DeviceAttributeMaxValueLength:
+		// kube-ovn reads the Subnet from this attribute, so it cannot be shortened.
+		return fmt.Errorf("subnet %q is longer than the %d bytes of a device attribute", s.Name, resourceapi.DeviceAttributeMaxValueLength)
 	}
 	return nil
 }
@@ -271,14 +275,21 @@ func Device(s Subnet, withCapacity bool) resourceapi.Device {
 	if s.VlanID != 0 {
 		attrs[AttrVlanID] = resourceapi.DeviceAttribute{IntValue: ptr.To(s.VlanID)}
 	}
-	if s.Provider != "" {
-		attrs[AttrProvider] = resourceapi.DeviceAttribute{StringValue: ptr.To(s.Provider)}
-	}
-	if s.ProviderNetwork != "" {
-		attrs[AttrProviderNetwork] = resourceapi.DeviceAttribute{StringValue: ptr.To(s.ProviderNetwork)}
-	}
-	if s.VPC != "" {
-		attrs[AttrVPC] = resourceapi.DeviceAttribute{StringValue: ptr.To(s.VPC)}
+	for name, value := range map[resourceapi.QualifiedName]string{
+		AttrProvider:        s.Provider,
+		AttrProviderNetwork: s.ProviderNetwork,
+		AttrVPC:             s.VPC,
+	} {
+		switch {
+		case value == "":
+		case len(value) > resourceapi.DeviceAttributeMaxValueLength:
+			// A value the API rejects would invalidate the whole ResourceSlice, and a
+			// shortened one would look valid to a selector. These attributes are only
+			// there for selectors, so the device goes without it.
+			klog.V(4).InfoS("Not publishing a device attribute, its value is too long", "subnet", s.Name, "attribute", name, "value", value)
+		default:
+			attrs[name] = resourceapi.DeviceAttribute{StringValue: ptr.To(value)}
+		}
 	}
 
 	device := resourceapi.Device{
@@ -296,6 +307,11 @@ func Device(s Subnet, withCapacity bool) resourceapi.Device {
 		device.Capacity = capacities(s)
 	}
 	return device
+}
+
+// Exhausted reports whether an enabled family of the Subnet has no address left.
+func (s Subnet) Exhausted() bool {
+	return (s.V4.Enabled && s.V4.Capacity() == 0) || (s.V6.Enabled && s.V6.Capacity() == 0)
 }
 
 // capacities publishes one capacity per address family of the Subnet. A NIC

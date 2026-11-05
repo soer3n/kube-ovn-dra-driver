@@ -36,8 +36,10 @@ import (
 
 // Live migration of KubeVirt VMs with a DRA NIC. A claim may be shared by the
 // virt-launcher pods of one VM, so a VM with a named claim migrates without a
-// second address, also while its pool is full. A VM with a claim template gets
-// a second claim for the migration's target pod, which needs a free address.
+// second address, also while its pool is full; KubeVirt from v1.10.0-rc.0 on
+// refuses that migration, and the specs check the refusal there. A VM with a
+// claim template gets a second claim for the migration's target pod, which
+// needs a free address.
 //
 // The specs need KubeVirt with the kube-ovn-nic binding as a KubeVirt Plugin
 // (deployments/kubevirt), the driver in central publish mode with
@@ -122,6 +124,11 @@ const (
 	fieldIPv4           = "v4IpAddress"
 	fieldMAC            = "macAddress"
 	flagTimeout         = "--timeout=5m"
+
+	// msgNamedClaimRefused is part of the reason KubeVirt from v1.10.0-rc.0
+	// on gives when it refuses to migrate a VM whose DRA network is backed by
+	// a named claim (VEP-183).
+	msgNamedClaimRefused = "use a ResourceClaimTemplate instead"
 
 	runStrategyHalted = "Halted"
 	runStrategyAlways = "Always"
@@ -416,18 +423,25 @@ func expectPoolFull(ctx context.Context, subnet string) {
 	}, defaultTimeout, pollInterval).Should(BeZero(), "subnet %s should have no free address", subnet)
 }
 
-// startMigration creates a migration of the VMI and returns its name.
-func startMigration(ctx context.Context, vm, name string) string {
+// migrationObject is a VirtualMachineInstanceMigration of the VMI with a
+// generated name.
+func migrationObject(vm string) *unstructured.Unstructured {
 	migration := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": vmimGVR.GroupVersion().String(),
 		"kind":       "VirtualMachineInstanceMigration",
 		"metadata":   map[string]any{"labels": map[string]any{"e2e": "migration"}},
 		"spec":       map[string]any{fieldVMIName: vm},
 	}}
+	migration.SetGenerateName(vm + "-")
+	return migration
+}
+
+// startMigration creates a migration of the VMI and returns its name.
+func startMigration(ctx context.Context, vm, name string) string {
+	migration := migrationObject(vm)
 	if name != "" {
+		migration.SetGenerateName("")
 		migration.SetName(name)
-	} else {
-		migration.SetGenerateName(vm + "-")
 	}
 	created, err := dynClient.Resource(vmimGVR).Namespace(namespace).Create(ctx, migration, metav1.CreateOptions{})
 	Expect(err).NotTo(HaveOccurred(), "migrate vmi %s", vm)
@@ -474,6 +488,27 @@ func expectMigrations(ctx context.Context, vm string, nics ...nicPeer) {
 			Expect(vmNIC(ctx, vm, n.provider)).To(Equal(before[i]), "vm %s should keep IP and MAC on %s", vm, n.provider)
 			expectReachable(n.peer, before[i])
 		}
+	}
+}
+
+// expectNamedClaimMigrations runs expectMigrations for a VM with named claims
+// where KubeVirt migrates such a VM. KubeVirt from v1.10.0-rc.0 on refuses the
+// migration at admission (VEP-183); there the spec checks that it refuses and
+// that the VM stays where it runs.
+func expectNamedClaimMigrations(ctx context.Context, vm string, nics ...nicPeer) {
+	_, err := dynClient.Resource(vmimGVR).Namespace(namespace).Create(ctx, migrationObject(vm), metav1.CreateOptions{DryRun: []string{metav1.DryRunAll}})
+	if err == nil {
+		expectMigrations(ctx, vm, nics...)
+		return
+	}
+	Expect(err.Error()).To(ContainSubstring(msgNamedClaimRefused), "migrate vmi %s", vm)
+	By("KubeVirt refuses to migrate " + vm + " with a named claim, checking that it stays on its node")
+	node := vmiField(ctx, vm, fieldNodeName)
+	Consistently(func() string {
+		return vmiField(ctx, vm, fieldNodeName)
+	}, pollInterval*3, pollInterval).Should(Equal(node), "vmi %s should stay on %s", vm, node)
+	for _, n := range nics {
+		expectReachable(n.peer, vmNIC(ctx, vm, n.provider))
 	}
 }
 
@@ -585,7 +620,7 @@ var _ = Describe("Live migration of KubeVirt VMs with a DRA NIC", Ordered, Label
 
 	It("keeps IP and MAC of a VM with a named claim across live migrations while the pool is full", func() {
 		expectPoolFull(ctx, migrationSubnet)
-		expectMigrations(ctx, namedVM, nicPeer{migrationProvider, peerPod})
+		expectNamedClaimMigrations(ctx, namedVM, nicPeer{migrationProvider, peerPod})
 	})
 
 	It("keeps the migration target of a VM with a claim template pending while the pool is full", func() {
@@ -675,7 +710,7 @@ var _ = Describe("Live migration of a KubeVirt VM with an overlay and a VLAN DRA
 		if !publisherRunning(ctx) {
 			Skip(msgSkipNodeBoundClaim)
 		}
-		expectMigrations(ctx, multiNICVM, nicPeer{overlayProvider, overlayPeer}, nicPeer{underlayProvider, underlayPeer})
+		expectNamedClaimMigrations(ctx, multiNICVM, nicPeer{overlayProvider, overlayPeer}, nicPeer{underlayProvider, underlayPeer})
 	})
 
 	// Both claims are allocated anew at the start, close to each other: a NIC
@@ -724,7 +759,7 @@ var _ = Describe("Live migration of a KubeVirt VM with a DRA NIC and a DataVolum
 
 	It("keeps IP and MAC of the VM across live migrations while the pool is full", func() {
 		expectPoolFull(ctx, rwxSubnet)
-		expectMigrations(ctx, rwxVM, nicPeer{ovnProvider(rwxSubnet), rwxPeerPod})
+		expectNamedClaimMigrations(ctx, rwxVM, nicPeer{ovnProvider(rwxSubnet), rwxPeerPod})
 	})
 })
 

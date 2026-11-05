@@ -48,8 +48,15 @@ func ReadyNodeSelector(providerNetwork string) *corev1.NodeSelector {
 // pool is available on all nodes for an overlay Subnet, and on the nodes of the
 // ProviderNetwork for a VLAN underlay Subnet.
 func Pool(s Subnet, withCapacity bool) resourceslice.Pool {
+	// The API refuses a capacity of 0 with the request policy of one address, and
+	// without that policy a claim would consume nothing and overbook the Subnet.
+	// So a Subnet without a free address has no device until one is free again.
+	var devices []resourceapi.Device
+	if !withCapacity || !s.Exhausted() {
+		devices = append(devices, Device(s, withCapacity))
+	}
 	pool := resourceslice.Pool{
-		Slices: []resourceslice.Slice{{Devices: []resourceapi.Device{Device(s, withCapacity)}}},
+		Slices: []resourceslice.Slice{{Devices: devices}},
 	}
 	if s.ProviderNetwork != "" {
 		pool.NodeSelector = ReadyNodeSelector(s.ProviderNetwork)

@@ -12,8 +12,9 @@ name: Run e2e tests
 # Plugin (deployments/kubevirt) (E2E_KUBEVIRT=1); kubevirt-rwx, only on request,
 # also migrates a VM with a DataVolume on NFS (E2E_RWX=1). The KubeVirt variants run
 # the latest release, v1.9.0; kubevirt-1.10 runs the kubevirt variant on
-# v1.10.0-beta.0, whose Plugin API calls the hook list launcherHooks (make
-# kind-deploy-kubevirt converts deployments/kubevirt/plugin.yaml). The dual variant runs
+# v1.10.0-rc.0, whose Plugin API calls the hook list launcherHooks (make
+# kind-deploy-kubevirt converts deployments/kubevirt/plugin.yaml) and which refuses
+# to migrate a VM with a named claim (the specs check the refusal). The dual variant runs
 # the suite in a dual-stack cluster with the dual-stack and IPv6-only specs
 # (E2E_IP_FAMILY=dual). node and node-dual run the underlay variant with the
 # driver in node publish mode (E2E_PUBLISH_MODE=node), in an IPv4 and in a
@@ -53,7 +54,7 @@ jobs:
       E2E_IP_FAMILY: ${{ endsWith(matrix.variant, 'dual') && 'dual' || 'ipv4' }}
       E2E_PUBLISH_MODE: ${{ startsWith(matrix.variant, 'node') && 'node' || 'central' }}
       # set for every variant: an empty value would override the Makefile default
-      KUBEVIRT_VERSION: ${{ matrix.variant == 'kubevirt-1.10' && 'v1.10.0-beta.0' || 'v1.9.0' }}
+      KUBEVIRT_VERSION: ${{ matrix.variant == 'kubevirt-1.10' && 'v1.10.0-rc.0' || 'v1.9.0' }}
     defaults:
       run:
         working-directory: kube-ovn-dra-driver

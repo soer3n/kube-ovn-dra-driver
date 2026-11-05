@@ -385,6 +385,10 @@ func TestLookupPodForClaimSharedClaim(t *testing.T) {
 	target := launcher(testTargetPod, testTargetUID, testNodeB, testVM)
 	otherVM := launcher(testTargetPod, testTargetUID, testNodeB, testOtherVM)
 	sameNode := launcher(testTargetPod, testTargetUID, testNodeA, testVM)
+	finishedSource := source.DeepCopy()
+	finishedSource.Status.Phase = corev1.PodSucceeded
+	failedSource := source.DeepCopy()
+	failedSource.Status.Phase = corev1.PodFailed
 	plain := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: testTargetPod, Namespace: testNS, UID: testTargetUID}, Spec: corev1.PodSpec{NodeName: testNodeB}}
 	claim := &resourceapi.ResourceClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "vm-nic", Namespace: testNS},
@@ -408,6 +412,9 @@ func TestLookupPodForClaimSharedClaim(t *testing.T) {
 		{"pods of different VMs", []runtime.Object{source, otherVM}, testNodeB, "", true},
 		{"pod that is no VM", []runtime.Object{source, plain}, testNodeB, "", true},
 		{"two consumers on one node", []runtime.Object{source, sameNode}, testNodeA, "", true},
+		{"finished source on the node of the target", []runtime.Object{finishedSource, sameNode}, testNodeA, testTargetPod, false},
+		{"failed source on the node of the target", []runtime.Object{failedSource, sameNode}, testNodeA, testTargetPod, false},
+		{"only a finished pod on the node", []runtime.Object{finishedSource, target}, testNodeA, "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
