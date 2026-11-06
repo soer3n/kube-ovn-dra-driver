@@ -129,9 +129,8 @@ const (
 	pluginBinary           = "kube-ovn-dra-kubeletplugin"
 	testNodeNameFlag       = "--node-name=n"
 
-	kindSubnet = "Subnet"
-	kindVlan   = "Vlan"
-	kindIP     = "IP"
+	kindVlan = "Vlan"
+	kindIP   = "IP"
 
 	// Fields of the kube-ovn and node fixtures.
 	fieldAPIVersion  = "apiVersion"

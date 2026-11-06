@@ -58,12 +58,13 @@ func ParseIP(obj *unstructured.Unstructured) (IPRef, bool) {
 // address of a VM after the VM so that it survives restarts.
 type OwnersOf func(namespace, pod string) []string
 
-// ApplyHeld sets Held on the families of subnets from the allocated claims of
-// the driver. claims are all ResourceClaims, ips are all ip objects.
+// ApplyHeld sets Held and Allocated on the families of subnets from the
+// allocated claims of the driver. claims are all ResourceClaims, ips are all ip objects.
 func ApplyHeld(subnets []Subnet, driver string, claims []*resourceapi.ResourceClaim, ips []IPRef, owners OwnersOf) {
 	byName := make(map[string]*Subnet, len(subnets))
 	for i := range subnets {
 		subnets[i].V4.Held, subnets[i].V6.Held = 0, 0
+		subnets[i].V4.Allocated, subnets[i].V6.Allocated = 0, 0
 		byName[subnets[i].Name] = &subnets[i]
 	}
 
@@ -120,6 +121,8 @@ func ApplyHeld(subnets []Subnet, driver string, claims []*resourceapi.ResourceCl
 				have += addresses[key{claim.Namespace, name, subnetName}]
 			}
 			subnet := byName[subnetName]
+			subnet.V4.Allocated += u.v4
+			subnet.V6.Allocated += u.v6
 			subnet.V4.Held += min(u.v4, have)
 			subnet.V6.Held += min(u.v6, have)
 		}

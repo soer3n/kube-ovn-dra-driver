@@ -38,7 +38,15 @@ rules:
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get"]
-# This ClusterRole owns the ResourceSlices, so they are removed with it.
+# Events on a Subnet that runs out of addresses and gets a free one again. A
+# Subnet is cluster-scoped, so the Events are in the default namespace.
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+# This ClusterRole also owns the ResourceSlices. It is only the owner because the
+# garbage collector needs a cluster-scoped owner for a cluster-scoped slice, and
+# because it exists exactly as long as the publisher: helm uninstall and
+# switching to node mode remove it, and with it the slices.
 - apiGroups: ["rbac.authorization.k8s.io"]
   resources: ["clusterroles"]
   resourceNames: ["{{ include "kube-ovn-dra-driver.fullname" . }}-publisher"]

@@ -414,6 +414,15 @@ func TestHeldCountsOnlyClaimsWithAnAddress(t *testing.T) {
 
 	assert.Equal(t, int64(1), subnets[0].V4.Held, "the claim without an address yet is left to the scheduler")
 	assert.Equal(t, int64(11), subnets[0].V4.Capacity())
+	assert.Equal(t, int64(2), subnets[0].V4.Allocated, "both allocated claims consume an address")
+}
+
+func TestFullWhenAllocatedClaimsConsumeTheCapacity(t *testing.T) {
+	assert.True(t, Subnet{V4: Family{Enabled: true}}.Full(), "an exhausted Subnet is full")
+	assert.True(t, Subnet{V4: Family{Enabled: true, Held: 5, Allocated: 5}}.Full(), "claims that hold every address fill the Subnet")
+	assert.True(t, Subnet{V4: Family{Enabled: true, Free: 1, Held: 4, Allocated: 5}}.Full(), "a claim without an address yet still takes one")
+	assert.False(t, Subnet{V4: Family{Enabled: true, Free: 1, Held: 4, Allocated: 4}}.Full())
+	assert.False(t, Subnet{V4: Family{Enabled: true, Free: 1}, V6: Family{}}.Full(), "a disabled family is never full")
 }
 
 func TestHeldIgnoresUnallocatedForeignAndUnknownClaims(t *testing.T) {

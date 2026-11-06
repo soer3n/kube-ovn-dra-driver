@@ -41,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
@@ -91,6 +92,9 @@ type Family struct {
 	// already allocated. The Subnet status counts them as used, but the
 	// scheduler subtracts every allocated claim again, so they are added back.
 	Held int64
+	// Allocated is the number of addresses the allocated DRA claims consume,
+	// with or without an address from kube-ovn yet.
+	Allocated int64
 }
 
 // Capacity returns what the device publishes for the family.
@@ -101,6 +105,7 @@ func (f Family) Capacity() int64 {
 // Subnet is the part of a kube-ovn Subnet the driver cares about.
 type Subnet struct {
 	Name     string
+	UID      types.UID
 	Provider string
 	VPC      string
 	// VlanID and ProviderNetwork are set for a VLAN underlay Subnet only.
@@ -197,7 +202,7 @@ func ParseVlan(obj *unstructured.Unstructured) VlanInfo {
 // ParseSubnet reads a kube-ovn Subnet. vlans resolves the Vlan a Subnet
 // references by name; it returns an error if the Vlan cannot be read.
 func ParseSubnet(obj *unstructured.Unstructured, vlans func(name string) (VlanInfo, error)) (Subnet, error) {
-	s := Subnet{Name: obj.GetName()}
+	s := Subnet{Name: obj.GetName(), UID: obj.GetUID()}
 	spec, _, err := unstructured.NestedMap(obj.Object, "spec")
 	if err != nil || spec == nil {
 		return Subnet{}, fmt.Errorf("subnet %q has no spec", s.Name)
@@ -312,6 +317,13 @@ func Device(s Subnet, withCapacity bool) resourceapi.Device {
 // Exhausted reports whether an enabled family of the Subnet has no address left.
 func (s Subnet) Exhausted() bool {
 	return (s.V4.Enabled && s.V4.Capacity() == 0) || (s.V6.Enabled && s.V6.Capacity() == 0)
+}
+
+// Full reports whether an enabled family of the Subnet has no address left for
+// a new claim: it is exhausted, or the allocated claims consume its capacity.
+func (s Subnet) Full() bool {
+	full := func(f Family) bool { return f.Enabled && f.Capacity() <= f.Allocated }
+	return full(s.V4) || full(s.V6)
 }
 
 // capacities publishes one capacity per address family of the Subnet. A NIC

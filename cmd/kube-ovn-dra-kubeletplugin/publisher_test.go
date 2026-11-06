@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 
 	"github.com/soer3n/kube-ovn-dra-driver/internal/publisher"
 )
@@ -136,6 +137,33 @@ func TestSnapshotIsStableBetweenCalls(t *testing.T) {
 	second, err := s.resources()
 	require.NoError(t, err)
 	assert.Equal(t, first, second, "an unchanged cluster must not look like a change")
+}
+
+func TestFullSubnetEvents(t *testing.T) {
+	free := publisher.Family{Enabled: true, Free: 1}
+	none := publisher.Family{Enabled: true}
+	recorder := record.NewFakeRecorder(10)
+	full := newFullSubnets(recorder)
+	events := func() []string {
+		var got []string
+		for len(recorder.Events) > 0 {
+			got = append(got, <-recorder.Events)
+		}
+		return got
+	}
+	warning := corev1.EventTypeWarning + " " + reasonSubnetFull + " " + msgSubnetFull
+	normal := corev1.EventTypeNormal + " " + reasonSubnetAvailable + " " + msgSubnetAvailable
+
+	full.update([]publisher.Subnet{{Name: testOverlaySubnet, V4: none}, {Name: testVlanSubnet, V4: free}})
+	assert.Equal(t, []string{warning}, events(), "a full Subnet gets a warning")
+	full.update([]publisher.Subnet{{Name: testOverlaySubnet, V4: none}, {Name: testVlanSubnet, V4: free}})
+	assert.Empty(t, events(), "a Subnet that stays full gets no second warning")
+	full.update([]publisher.Subnet{{Name: testOverlaySubnet, V4: free}, {Name: testVlanSubnet, V4: free}})
+	assert.Equal(t, []string{normal}, events(), "a Subnet with a free address again gets a normal Event")
+	full.update([]publisher.Subnet{{Name: testOverlaySubnet, V4: free}})
+	assert.Empty(t, events(), "a Subnet that was never full gets no Event")
+	full.update([]publisher.Subnet{{Name: testOverlaySubnet, V4: publisher.Family{Enabled: true, Held: 1, Allocated: 1}}})
+	assert.Equal(t, []string{warning}, events(), "a Subnet whose addresses the allocated claims take gets a warning")
 }
 
 func TestPodOwnersAddsTheVMOfALauncherPod(t *testing.T) {

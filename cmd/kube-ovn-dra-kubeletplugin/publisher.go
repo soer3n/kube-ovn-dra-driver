@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/urfave/cli/v2"
+	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -35,9 +36,12 @@ import (
 	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
 
@@ -63,6 +67,15 @@ const (
 	publisherRefreshDelay = 3 * time.Second
 
 	podOwnersTTL = time.Minute
+
+	// The Events the publisher records on a Subnet whose device it withdraws for
+	// lack of a free address, and when it publishes the device again.
+	kindSubnet            = "Subnet"
+	eventComponent        = "kube-ovn-dra-publisher"
+	reasonSubnetFull      = "SubnetFull"
+	reasonSubnetAvailable = "SubnetAvailable"
+	msgSubnetFull         = "No free address left for a new DRA claim: pods with new claims on the Subnet stay unschedulable until an address is free"
+	msgSubnetAvailable    = "An address is free again for a new DRA claim"
 )
 
 type publisherFlags struct {
@@ -237,9 +250,14 @@ func publish(ctx context.Context, f *publisherFlags, clientSets flags.ClientSets
 		return fmt.Errorf("sync informers: %w", ctx.Err())
 	}
 
+	broadcaster := record.NewBroadcaster(record.WithContext(ctx))
+	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: clientSets.Core.CoreV1().Events("")})
+	defer broadcaster.Shutdown()
+
 	snapshot := &snapshotter{
 		driverName: f.driverName,
 		capacity:   f.capacity,
+		full:       newFullSubnets(broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: eventComponent})),
 		subnets:    subnets.GetStore(),
 		vlans:      vlans.GetStore(),
 		ips:        ips.GetStore(),
@@ -305,6 +323,7 @@ type snapshotter struct {
 	ips        cache.Store
 	claims     cache.Store
 	owners     publisher.OwnersOf
+	full       *fullSubnets
 }
 
 func (s *snapshotter) resources() (resourceslice.DriverResources, error) {
@@ -364,8 +383,49 @@ func (s *snapshotter) resources() (resourceslice.DriverResources, error) {
 			}
 		}
 		publisher.ApplyHeld(subnets, s.driverName, claims, ipRefs, s.owners)
+		if s.full != nil {
+			s.full.update(subnets)
+		}
 	}
 	return resourceslice.DriverResources{Pools: publisher.Pools(subnets, s.capacity)}, nil
+}
+
+// fullSubnets records an Event on a Subnet when it has no address left for a new
+// claim (see publisher.Subnet.Full), and when it has one again. The scheduler
+// only tells a pod that it cannot allocate its claims, so the Event
+// on the Subnet is where to see why. A Subnet is cluster-scoped, so its Events
+// are in the default namespace.
+type fullSubnets struct {
+	recorder record.EventRecorder
+	full     map[string]bool
+}
+
+func newFullSubnets(recorder record.EventRecorder) *fullSubnets {
+	return &fullSubnets{recorder: recorder, full: map[string]bool{}}
+}
+
+// update records the changes since the last call: a Subnet that is full now,
+// and a Subnet that was full and has a free address again.
+func (f *fullSubnets) update(subnets []publisher.Subnet) {
+	full := make(map[string]bool, len(f.full))
+	for _, s := range subnets {
+		ref := &corev1.ObjectReference{
+			APIVersion: publisher.SubnetGVR.GroupVersion().String(),
+			Kind:       kindSubnet,
+			Name:       s.Name,
+			UID:        s.UID,
+		}
+		switch {
+		case s.Full():
+			full[s.Name] = true
+			if !f.full[s.Name] {
+				f.recorder.Event(ref, corev1.EventTypeWarning, reasonSubnetFull, msgSubnetFull)
+			}
+		case f.full[s.Name]:
+			f.recorder.Event(ref, corev1.EventTypeNormal, reasonSubnetAvailable, msgSubnetAvailable)
+		}
+	}
+	f.full = full
 }
 
 // podOwners finds the names the address of a pod's NIC can carry: the pod, and

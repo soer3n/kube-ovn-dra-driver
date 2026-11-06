@@ -52,6 +52,11 @@ const (
 	capacityLabel       = "e2e=capacity"
 	capacityPodNamePref = "cap-"
 	netshootImage       = "nicolaka/netshoot@sha256:47b907d662d139d1e2f22bfe14f4efca1e3f1feed283572f47c970c780c03b61"
+
+	// The Events the publisher records on a Subnet that runs out of addresses and
+	// gets one again, in the default namespace since a Subnet is cluster-scoped.
+	reasonSubnetFull      = "SubnetFull"
+	reasonSubnetAvailable = "SubnetAvailable"
 )
 
 var (
@@ -114,6 +119,22 @@ func subnetNames(ctx context.Context) (published, unpublished []string) {
 }
 
 // subnetFree returns the free IPv4 addresses a Subnet reports in its status.
+// subnetEvents counts the Events with the reason on the Subnet as it exists now,
+// so Events of an earlier Subnet of the same name do not count.
+func subnetEvents(ctx context.Context, subnet, reason string) int {
+	obj, err := dynClient.Resource(subnetGVR).Get(ctx, subnet, metav1.GetOptions{})
+	if err != nil {
+		return 0
+	}
+	events, err := clientset.CoreV1().Events(metav1.NamespaceDefault).List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("involvedObject.kind=Subnet,involvedObject.name=%s,involvedObject.uid=%s,reason=%s", subnet, obj.GetUID(), reason),
+	})
+	if err != nil {
+		return 0
+	}
+	return len(events.Items)
+}
+
 func subnetFree(ctx context.Context, subnet string) (int64, bool) {
 	obj, err := dynClient.Resource(subnetGVR).Get(ctx, subnet, metav1.GetOptions{})
 	if err != nil {
@@ -412,10 +433,22 @@ var _ = Describe("kube-ovn NIC DRA driver in central publish mode", Ordered, fun
 		Consistently(func() (string, error) {
 			return kubectl(kubectlGet, resourcePod, over, flagOutput, "jsonpath={.spec.nodeName}")
 		}, 20*time.Second, pollInterval).Should(BeEmpty())
+		Eventually(func() int {
+			return subnetEvents(ctx, capacitySubnet, reasonSubnetFull)
+		}, defaultTimeout, pollInterval).Should(BeNumerically(">", 0), "the full subnet %s should have a %s Event", capacitySubnet, reasonSubnetFull)
 
 		By("the pod being admitted once a pod released its address")
 		out, err = kubectl(kubectlDelete, podsAndClaims, pods[0], flagWait)
 		Expect(err).NotTo(HaveOccurred(), msgKubectlDelete, out)
 		waitRunning(over)
+
+		// The waiting pod took the released address, so the Subnet only has a
+		// free address again once a second pod releases its own.
+		By("the subnet reporting a free address once no pod is waiting for it")
+		out, err = kubectl(kubectlDelete, podsAndClaims, pods[1], flagWait)
+		Expect(err).NotTo(HaveOccurred(), msgKubectlDelete, out)
+		Eventually(func() int {
+			return subnetEvents(ctx, capacitySubnet, reasonSubnetAvailable)
+		}, defaultTimeout, pollInterval).Should(BeNumerically(">", 0), "the subnet %s should have a %s Event after the release", capacitySubnet, reasonSubnetAvailable)
 	})
 })
